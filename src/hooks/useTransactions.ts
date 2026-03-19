@@ -9,6 +9,7 @@ import {
 } from "@/types";
 import { computeSummary } from "@/lib/categorizer";
 import { maskSensitiveData } from "@/lib/maskSensitive";
+import { isTotalOrSummaryDescription } from "@/lib/totalSummaryFilter";
 import {
   generateEncryptionKey,
   exportKey,
@@ -26,6 +27,7 @@ export type AppState =
 export interface PDFVisualizerData {
   rawLines: string[];
   bankDetected: string;
+  pdfBase64?: string; // Original PDF for rendering pages as images
 }
 
 // Try to parse lines using a saved custom pattern from localStorage
@@ -131,19 +133,44 @@ export function useTransactions() {
     setError(null);
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      let res: Response;
 
-      const headers: Record<string, string> = {};
-      if (exportedKey.current) {
-        headers["X-Encryption-Key"] = exportedKey.current;
+      if (encryptionKey.current && exportedKey.current) {
+        // E2E encrypted upload: convert file to base64, encrypt, send as JSON
+        const arrayBuffer = await file.arrayBuffer();
+        // Convert to base64 in chunks to avoid call-stack overflow on large files
+        const bytes = new Uint8Array(arrayBuffer);
+        const CHUNK = 8192;
+        let binary = "";
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+        }
+        const base64 = btoa(binary);
+        const payload = JSON.stringify({
+          filename: file.name,
+          fileBase64: base64,
+        });
+        const encryptedPayload = await encrypt(
+          encryptionKey.current,
+          payload
+        );
+        res = await fetch("/api/upload", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Encryption-Key": exportedKey.current,
+          },
+          body: JSON.stringify({ encrypted: encryptedPayload }),
+        });
+      } else {
+        // Fallback: plain FormData upload
+        const formData = new FormData();
+        formData.append("file", file);
+        res = await fetch("/api/upload", {
+          method: "POST",
+          body: formData,
+        });
       }
-
-      const res = await fetch("/api/upload", {
-        method: "POST",
-        headers,
-        body: formData,
-      });
 
       const rawData = await res.json();
 
@@ -176,6 +203,7 @@ export function useTransactions() {
         setPdfVisualizerData({
           rawLines: data.rawLines,
           bankDetected: bankId,
+          pdfBase64: data.pdfBase64,
         });
         setAppState("idle");
         return data;
@@ -239,8 +267,12 @@ export function useTransactions() {
           allCategorized.push(...data.transactions);
         }
 
-        setTransactions(allCategorized);
-        setSummary(computeSummary(allCategorized));
+        const displayOnly = allCategorized.filter(
+          (tx) => !isTotalOrSummaryDescription(tx.description)
+        );
+        setTransactions(displayOnly);
+        setSummary(computeSummary(displayOnly));
+        setRawTransactions([]); // Clear raw data so categorize can't be pressed again
         setAppState("done");
       } catch (err) {
         const message =

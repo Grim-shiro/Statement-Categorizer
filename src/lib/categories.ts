@@ -1,4 +1,4 @@
-import { Category } from "@/types";
+import type { Category } from "@/types";
 
 export const KEYWORD_RULES: Record<string, Category> = {
   // Rent
@@ -160,6 +160,36 @@ export const KEYWORD_RULES: Record<string, Category> = {
   "state tax": "Taxes",
   "property tax": "Taxes",
   "sales tax": "Taxes",
+
+  // Owner Deposits (Capital Contributions)
+  "owner deposit": "Owner Deposits",
+  "owner contribution": "Owner Deposits",
+  "capital contribution": "Owner Deposits",
+  "capital injection": "Owner Deposits",
+  "shareholder deposit": "Owner Deposits",
+  "shareholder loan": "Owner Deposits",
+  "director deposit": "Owner Deposits",
+  "director loan": "Owner Deposits",
+  "personal deposit": "Owner Deposits",
+  "owner invest": "Owner Deposits",
+  "equity contribution": "Owner Deposits",
+  "owner loan": "Owner Deposits",
+  "member contribution": "Owner Deposits",
+  "partner contribution": "Owner Deposits",
+
+  // Owner Draws (Withdrawals)
+  "owner draw": "Owner Draws",
+  "owner withdrawal": "Owner Draws",
+  "owner payout": "Owner Draws",
+  "shareholder draw": "Owner Draws",
+  "shareholder withdrawal": "Owner Draws",
+  "director draw": "Owner Draws",
+  "director withdrawal": "Owner Draws",
+  "personal withdrawal": "Owner Draws",
+  "capital withdrawal": "Owner Draws",
+  "distribution": "Owner Draws",
+  "member draw": "Owner Draws",
+  "partner draw": "Owner Draws",
 };
 
 export function normalizeMerchant(description: string): string {

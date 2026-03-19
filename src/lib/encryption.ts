@@ -17,6 +17,16 @@ const ALGORITHM = "AES-GCM";
 const KEY_LENGTH = 256;
 const IV_LENGTH = 12; // 96 bits recommended for AES-GCM
 
+/** Convert a Uint8Array to base64 without overflowing the call stack */
+function uint8ToBase64(bytes: Uint8Array): string {
+  const CHUNK = 8192;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
 export async function generateEncryptionKey(): Promise<CryptoKey> {
   return crypto.subtle.generateKey(
     { name: ALGORITHM, length: KEY_LENGTH },
@@ -27,7 +37,7 @@ export async function generateEncryptionKey(): Promise<CryptoKey> {
 
 export async function exportKey(key: CryptoKey): Promise<string> {
   const raw = await crypto.subtle.exportKey("raw", key);
-  return btoa(String.fromCharCode(...new Uint8Array(raw)));
+  return uint8ToBase64(new Uint8Array(raw));
 }
 
 export async function importKey(base64Key: string): Promise<CryptoKey> {
@@ -56,7 +66,7 @@ export async function encrypt(
   combined.set(iv);
   combined.set(new Uint8Array(ciphertext), iv.length);
 
-  return btoa(String.fromCharCode(...combined));
+  return uint8ToBase64(combined);
 }
 
 export async function decrypt(

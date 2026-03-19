@@ -1,4 +1,5 @@
-import { Category, MerchantMappings, RawTransaction, Transaction } from "@/types";
+import { DEFAULT_CATEGORIES, MerchantMappings, RawTransaction, Transaction } from "@/types";
+import type { Category } from "@/types";
 import { matchKeywordRule, normalizeMerchant } from "./categories";
 import { v4 as uuidv4 } from "uuid";
 
@@ -20,6 +21,8 @@ const HF_LABELS = [
   "Vehicle fuel gas transportation",
   "Bank fees charges",
   "Tax payment",
+  "Owner deposit capital contribution equity investment",
+  "Owner draw withdrawal distribution payout",
   "Other miscellaneous",
 ];
 
@@ -38,6 +41,8 @@ const LABEL_TO_CATEGORY: Record<string, Category> = {
   "Vehicle fuel gas transportation": "Vehicle & Fuel",
   "Bank fees charges": "Bank Fees",
   "Tax payment": "Taxes",
+  "Owner deposit capital contribution equity investment": "Owner Deposits",
+  "Owner draw withdrawal distribution payout": "Owner Draws",
   "Other miscellaneous": "Other",
 };
 

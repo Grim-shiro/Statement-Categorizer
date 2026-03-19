@@ -1,14 +1,18 @@
 "use client";
 
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useRef } from "react";
 import { PDFVisualizerData } from "@/hooks/useTransactions";
 import { RawTransaction } from "@/types";
 import { maskSensitiveData } from "@/lib/maskSensitive";
+import PDFPageRenderer, { SelectionRect } from "./PDFPageRenderer";
 
 interface PDFVisualizerProps {
   data: PDFVisualizerData;
   onDismiss: () => void;
-  onTransactionsExtracted: (transactions: RawTransaction[], bankId: string) => void;
+  onTransactionsExtracted: (
+    transactions: RawTransaction[],
+    bankId: string
+  ) => void;
 }
 
 // Try to extract a transaction from a single line
@@ -16,22 +20,16 @@ function extractTransactionFromLine(line: string): RawTransaction | null {
   const trimmed = line.trim();
   if (!trimmed) return null;
 
-  // Try to find a dollar amount (with or without $, with optional commas)
   const amountMatch = trimmed.match(/-?\$?([\d,]+\.\d{2})/);
   if (!amountMatch) return null;
 
   const amount = parseFloat(amountMatch[1].replace(/,/g, ""));
   if (isNaN(amount) || amount === 0) return null;
 
-  // Try to find a date in various formats
   const datePatterns = [
-    // Jan 15, Jan15, JAN 15
     /\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2})\b/i,
-    // 15 Jan, 15Jan
     /\b(\d{1,2}\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))\b/i,
-    // 01/15, 1/15, 01-15
     /\b(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)\b/,
-    // 2024-01-15
     /\b(\d{4}-\d{2}-\d{2})\b/,
   ];
 
@@ -47,7 +45,6 @@ function extractTransactionFromLine(line: string): RawTransaction | null {
   }
 
   if (!dateStr) {
-    // No date found - use the line without the amount as description
     const description = maskSensitiveData(
       trimmed
         .replace(/-?\$?[\d,]+\.\d{2}/, "")
@@ -57,11 +54,13 @@ function extractTransactionFromLine(line: string): RawTransaction | null {
     return {
       date: "",
       description: description || trimmed,
-      amount: trimmed.includes("-") && amountMatch[0].startsWith("-") ? -amount : amount,
+      amount:
+        trimmed.includes("-") && amountMatch[0].startsWith("-")
+          ? -amount
+          : amount,
     };
   }
 
-  // Description is everything between date and amount (or the rest of the line)
   const amountPos = trimmed.indexOf(amountMatch[0]);
   let description: string;
   if (amountPos > dateEnd) {
@@ -74,24 +73,26 @@ function extractTransactionFromLine(line: string): RawTransaction | null {
       .trim();
   }
 
-  // Clean up description
   description = description.replace(/^[\s\-–—]+|[\s\-–—]+$/g, "").trim();
 
   const signedAmount =
     trimmed.includes("-") && amountMatch[0].startsWith("-") ? -amount : amount;
 
-  return { date: dateStr, description: maskSensitiveData(description), amount: signedAmount };
+  return {
+    date: dateStr,
+    description: maskSensitiveData(description),
+    amount: signedAmount,
+  };
 }
 
-// Build a regex pattern string from selected transaction lines for future matching
 function buildPatternFromLines(lines: string[]): {
   dateRegex: string;
   amountRegex: string;
 } {
-  // Detect the most common date format
   let dateRegex =
     "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s*\\d{1,2}";
-  const slashDateCount = lines.filter((l) => /\d{1,2}\/\d{1,2}/.test(l)).length;
+  const slashDateCount = lines.filter((l) => /\d{1,2}\/\d{1,2}/.test(l))
+    .length;
   const monthNameCount = lines.filter((l) =>
     /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2}/i.test(l)
   ).length;
@@ -100,18 +101,396 @@ function buildPatternFromLines(lines: string[]): {
   ).length;
   const isoCount = lines.filter((l) => /\d{4}-\d{2}-\d{2}/.test(l)).length;
 
-  if (slashDateCount >= monthNameCount && slashDateCount >= dayFirstCount) {
+  if (slashDateCount >= monthNameCount && slashDateCount >= dayFirstCount)
     dateRegex = "\\d{1,2}\\/\\d{1,2}(?:\\/\\d{2,4})?";
-  } else if (dayFirstCount > monthNameCount) {
+  else if (dayFirstCount > monthNameCount)
     dateRegex =
       "\\d{1,2}\\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
-  } else if (isoCount > monthNameCount) {
-    dateRegex = "\\d{4}-\\d{2}-\\d{2}";
+  else if (isoCount > monthNameCount) dateRegex = "\\d{4}-\\d{2}-\\d{2}";
+
+  return { dateRegex, amountRegex: "-?\\$?\\d{1,3}(?:,\\d{3})*\\.\\d{2}" };
+}
+
+// Extract text from a PDF region using pdfjs text content, with OCR fallback
+async function extractTextFromRegion(
+  pdfBase64: string,
+  selection: SelectionRect
+): Promise<string[]> {
+  try {
+    const pdfjsLib = await import("pdfjs-dist");
+    pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+
+    const binaryStr = atob(pdfBase64);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+
+    const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+    const page = await pdf.getPage(selection.page);
+    const viewport = page.getViewport({ scale: 1.0 });
+
+    // Convert normalized coordinates to PDF coordinates
+    const selTop = selection.normY * viewport.height;
+    const selBottom = (selection.normY + selection.normHeight) * viewport.height;
+    const selLeft = selection.normX * viewport.width;
+    const selRight = (selection.normX + selection.normWidth) * viewport.width;
+
+    const textContent = await page.getTextContent();
+    const linesInRegion: { y: number; items: { x: number; str: string }[] }[] = [];
+
+    for (const item of textContent.items) {
+      if (!("transform" in item)) continue;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const textItem = item as any;
+      const pdfX = textItem.transform[4];
+      const pdfY = textItem.transform[5];
+      const viewY = viewport.height - pdfY;
+      const viewX = pdfX;
+
+      if (
+        viewX >= selLeft - 20 &&
+        viewX <= selRight + 20 &&
+        viewY >= selTop - 5 &&
+        viewY <= selBottom + 5
+      ) {
+        const existingLine = linesInRegion.find(
+          (l) => Math.abs(l.y - viewY) < 8
+        );
+        if (existingLine) {
+          existingLine.items.push({ x: viewX, str: textItem.str });
+        } else {
+          linesInRegion.push({ y: viewY, items: [{ x: viewX, str: textItem.str }] });
+        }
+      }
+    }
+
+    // Sort lines by Y, items within each line by X
+    linesInRegion.sort((a, b) => a.y - b.y);
+    const lines = linesInRegion.map((l) => {
+      l.items.sort((a, b) => a.x - b.x);
+      return l.items.map((i) => i.str).join(" ").trim();
+    }).filter((l) => l.length > 0);
+
+    // If pdfjs text extraction found lines, return them
+    if (lines.length > 0) {
+      console.log("[PDFVisualizer] pdfjs extracted", lines.length, "lines");
+      return lines;
+    }
+
+    // ── Fallback: OCR via Tesseract.js ──
+    console.log("[PDFVisualizer] pdfjs returned 0 text items, falling back to OCR...");
+    return await ocrExtractFromRegion(pdf, page, viewport, selection);
+  } catch (err) {
+    console.error("Failed to extract text from region:", err);
+    return [];
+  }
+}
+
+// OCR fallback: render the selected zone to a canvas and use Tesseract.js
+// Uses word-level bounding boxes to reconstruct table rows properly
+async function ocrExtractFromRegion(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  pdf: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  page: any,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  viewport: any,
+  selection: SelectionRect
+): Promise<string[]> {
+  try {
+    // Render the full page at high res for OCR quality
+    const ocrScale = 3.0;
+    const ocrViewport = page.getViewport({ scale: ocrScale });
+    const canvas = document.createElement("canvas");
+    canvas.width = ocrViewport.width;
+    canvas.height = ocrViewport.height;
+    const ctx = canvas.getContext("2d")!;
+    await page.render({ canvasContext: ctx, viewport: ocrViewport }).promise;
+
+    // Crop to the selected region
+    const cropX = Math.floor(selection.normX * ocrViewport.width);
+    const cropY = Math.floor(selection.normY * ocrViewport.height);
+    const cropW = Math.ceil(selection.normWidth * ocrViewport.width);
+    const cropH = Math.ceil(selection.normHeight * ocrViewport.height);
+
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = cropW;
+    cropCanvas.height = cropH;
+    const cropCtx = cropCanvas.getContext("2d")!;
+    cropCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+    // Run Tesseract OCR with word-level output
+    const Tesseract = await import("tesseract.js");
+    console.log("[PDFVisualizer] Running OCR on zone...");
+    const result = await Tesseract.recognize(cropCanvas.toDataURL("image/png"), "eng", {
+      logger: (m: { status: string; progress: number }) => {
+        if (m.status === "recognizing text") {
+          console.log(`[OCR] ${Math.round(m.progress * 100)}%`);
+        }
+      },
+    });
+
+    // Use word-level bounding boxes to reconstruct table rows
+    // Group words by their Y-center position (same row)
+    interface OcrWord { text: string; x: number; y: number; width: number; height: number }
+    const words: OcrWord[] = [];
+    for (const block of result.data.blocks || []) {
+      for (const paragraph of block.paragraphs || []) {
+        for (const line of paragraph.lines || []) {
+          for (const word of line.words || []) {
+            if (!word.text.trim()) continue;
+            const bbox = word.bbox;
+            words.push({
+              text: word.text.trim(),
+              x: bbox.x0,
+              y: (bbox.y0 + bbox.y1) / 2, // Y center
+              width: bbox.x1 - bbox.x0,
+              height: bbox.y1 - bbox.y0,
+            });
+          }
+        }
+      }
+    }
+
+    if (words.length === 0) {
+      // Fallback to plain text if no word-level data
+      const text = result.data.text;
+      console.log("[PDFVisualizer] OCR text (no word data):", text.substring(0, 500));
+      return text.split("\n").map((l: string) => l.trim()).filter((l: string) => l.length > 0);
+    }
+
+    // Group words into rows by Y-center (tolerance based on average word height)
+    const avgHeight = words.reduce((s, w) => s + w.height, 0) / words.length;
+    const rowTolerance = avgHeight * 0.6;
+
+    const rows: { y: number; words: OcrWord[] }[] = [];
+    const sortedByY = [...words].sort((a, b) => a.y - b.y);
+
+    for (const word of sortedByY) {
+      const existingRow = rows.find(r => Math.abs(r.y - word.y) < rowTolerance);
+      if (existingRow) {
+        existingRow.words.push(word);
+        // Update row Y to average
+        existingRow.y = existingRow.words.reduce((s, w) => s + w.y, 0) / existingRow.words.length;
+      } else {
+        rows.push({ y: word.y, words: [word] });
+      }
+    }
+
+    // Sort rows top-to-bottom, words left-to-right within each row
+    rows.sort((a, b) => a.y - b.y);
+    const lines: string[] = rows.map(row => {
+      row.words.sort((a, b) => a.x - b.x);
+      return row.words.map(w => w.text).join(" ");
+    });
+
+    console.log("[PDFVisualizer] OCR reconstructed", lines.length, "rows from", words.length, "words");
+    for (let i = 0; i < Math.min(lines.length, 30); i++) {
+      console.log(`  [${i}] ${lines[i]}`);
+    }
+
+    return lines;
+  } catch (err) {
+    console.error("[PDFVisualizer] OCR fallback failed:", err);
+    return [];
+  }
+}
+
+// Fix common OCR misreads in bank statement text
+function cleanOcrLine(line: string): string {
+  const MONTHS = /(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)/gi;
+
+  // Fix dates: OCR misreads digits after month names (O→0, S→5, I/l→1, B→8, Z→2)
+  let cleaned = line.replace(
+    new RegExp(`((?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC))\\s*([A-Z0-9]{1,2})\\b`, "gi"),
+    (match, month, dayPart) => {
+      // Convert letter-digit confusions in the day part
+      const fixedDay = dayPart
+        .replace(/[Oo]/g, "0")
+        .replace(/[Ss]/g, "5")
+        .replace(/[Ii|lL]/g, "1")
+        .replace(/[Bb]/g, "8")
+        .replace(/[Zz]/g, "2");
+      // Only fix if the result is a valid day (01-31)
+      const dayNum = parseInt(fixedDay, 10);
+      if (dayNum >= 1 && dayNum <= 31) {
+        return `${month.toUpperCase()}${fixedDay}`;
+      }
+      return match;
+    }
+  );
+
+  // Remove stray pipe characters from OCR (| often appears as column separator artifact)
+  cleaned = cleaned.replace(/\s*\|\s*/g, " ");
+
+  // Fix common OCR artifacts in amounts: space in middle of number
+  cleaned = cleaned.replace(/(\d),\s+(\d{3})\./g, "$1,$2.");
+
+  return cleaned;
+}
+
+// Parse lines as a bank statement table with column headers
+// Handles formats like: Description | Withdrawals | Deposits | Date | Balance
+function parseBankTable(lines: string[]): RawTransaction[] {
+  if (lines.length < 2) return [];
+
+  // Try to detect a header row with "withdrawal" and "deposit" keywords
+  // Search ALL lines (OCR of full page can have many lines before the header)
+  let headerIdx = -1;
+  let hasWithdrawalCol = false;
+  let hasDepositCol = false;
+  for (let i = 0; i < lines.length; i++) {
+    const lower = lines[i].toLowerCase();
+    const hasW = lower.includes("withdrawal") || lower.includes("debit");
+    const hasD = lower.includes("deposit") || lower.includes("credit");
+    if (hasW || hasD) {
+      hasWithdrawalCol = hasWithdrawalCol || hasW;
+      hasDepositCol = hasDepositCol || hasD;
+      headerIdx = i;
+      break;
+    }
   }
 
-  const amountRegex = "-?\\$?\\d{1,3}(?:,\\d{3})*\\.\\d{2}";
+  if (headerIdx === -1) return [];
 
-  return { dateRegex, amountRegex };
+  // Clean OCR artifacts from all lines
+  lines = lines.map(cleanOcrLine);
+  console.log("[parseBankTable] Cleaned lines after header:");
+  for (let i = headerIdx + 1; i < Math.min(lines.length, headerIdx + 25); i++) {
+    console.log(`  [${i}] ${lines[i]}`);
+  }
+
+  // First pass: extract all rows with date, amounts, and balance
+  interface TableRow {
+    line: string;
+    date: string;
+    description: string;
+    amounts: number[];
+    balance: number | null;
+    lineIdx: number;
+  }
+
+  const DATE_RE = /\b((?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*\d{1,2})\b/i;
+  const rows: TableRow[] = [];
+  let startingBalance: number | null = null;
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (/total|closing\s*balance|opening\s*balance/i.test(line)) continue;
+    if (/account.*type|fees|rebate\s*balance|waived|paid\s*fees/i.test(line)) continue;
+
+    const dateMatch = line.match(DATE_RE);
+    if (!dateMatch) continue;
+
+    // Extract all amounts from the line
+    const amounts: { value: number; pos: number }[] = [];
+    const amtRe = /\$?([\d,]+\.\d{2})/g;
+    let m: RegExpExecArray | null;
+    while ((m = amtRe.exec(line)) !== null) {
+      amounts.push({ value: parseFloat(m[1].replace(/,/g, "")), pos: m.index });
+    }
+    if (amounts.length === 0) continue;
+
+    // Description: text before the first amount, without the date
+    const firstAmtPos = amounts[0].pos;
+    let description = firstAmtPos > 0 ? line.substring(0, firstAmtPos).trim() : "";
+    description = description.replace(DATE_RE, "").trim();
+    description = description.replace(/\s+/g, " ").replace(/^[\s\-–—]+|[\s\-–—]+$/g, "").trim();
+
+    // Starting balance row
+    if (/^starting\s*balance/i.test(description) || /starting\s*balance/i.test(line)) {
+      const lastAmt = amounts[amounts.length - 1].value;
+      startingBalance = lastAmt;
+      continue;
+    }
+
+    if (!description) continue;
+
+    // If there are 2+ amounts, the last one is likely the balance
+    let balance: number | null = null;
+    const txAmounts = amounts.map(a => a.value);
+    if (txAmounts.length >= 2) {
+      balance = txAmounts[txAmounts.length - 1];
+    }
+
+    rows.push({
+      line,
+      date: dateMatch[1],
+      description,
+      amounts: txAmounts,
+      balance,
+      lineIdx: i,
+    });
+  }
+
+  console.log("[parseBankTable] Found", rows.length, "data rows, startingBalance=", startingBalance);
+
+  // Second pass: use balance column to determine signs
+  // Balance goes: startingBalance → startingBalance + deposit - withdrawal → ...
+  // For each row, if we know the previous balance and current balance,
+  // sign = (currentBalance - prevBalance) matches the transaction amount
+  const txns: RawTransaction[] = [];
+  let prevBalance = startingBalance;
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const txAmount = row.amounts[0]; // First amount is the transaction amount
+    const rowBalance = row.balance;
+
+    let signedAmount: number;
+
+    // Try to determine sign from balance change
+    if (prevBalance !== null && rowBalance !== null) {
+      const delta = Math.round((rowBalance - prevBalance) * 100) / 100;
+      // delta > 0 means balance increased (deposit), delta < 0 means decreased (withdrawal)
+      // The transaction amount should be close to |delta| (possibly with multiple txns between balances)
+      if (Math.abs(Math.abs(delta) - txAmount) < 0.02) {
+        signedAmount = delta > 0 ? txAmount : -txAmount;
+      } else {
+        // Multiple transactions between balance points — use heuristic
+        signedAmount = heuristicSign(row.description, txAmount);
+      }
+    } else if (prevBalance !== null && rowBalance === null) {
+      // No balance on this row — check next row with a balance to determine accumulated delta
+      signedAmount = heuristicSign(row.description, txAmount);
+    } else {
+      signedAmount = heuristicSign(row.description, txAmount);
+    }
+
+    // Update prevBalance if this row has a balance
+    if (rowBalance !== null) prevBalance = rowBalance;
+
+    txns.push({
+      date: row.date,
+      description: maskSensitiveData(row.description),
+      amount: signedAmount,
+    });
+  }
+
+  return txns;
+}
+
+// Heuristic sign determination based on description
+function heuristicSign(description: string, amount: number): number {
+  const desc = description.toLowerCase();
+  // Withdrawals (negative)
+  if (/send\s*e-?t/i.test(desc)) return -amount;
+  if (/bill\s*py?mt|monthly.*fee|account\s*fee/i.test(desc)) return -amount;
+  if (/tfr-?to|trf.*to|transfer.*to/i.test(desc)) return -amount;
+  if (/atm\s*w\/d|atm.*withdraw/i.test(desc)) return -amount;
+  if (/^wise\b/i.test(desc)) return -amount;
+  if (/ind\s*all\s*life|sun\s*life|manulife|great.*west/i.test(desc)) return -amount;
+
+  // Deposits (positive)
+  if (/^e-?transfer/i.test(desc)) return amount;
+  if (/deposit|received|credit|refund|rebate|payroll|salary|income|interest/i.test(desc)) return amount;
+  if (/admin\s*by|canada\s*life|ins\s*$/i.test(desc)) return amount;
+  if (/cashback|cash\s*back|dividend|reimbursement/i.test(desc)) return amount;
+
+  // Default: withdrawal (most bank transactions are outgoing)
+  return -amount;
 }
 
 export default function PDFVisualizer({
@@ -119,11 +498,17 @@ export default function PDFVisualizer({
   onDismiss,
   onTransactionsExtracted,
 }: PDFVisualizerProps) {
+  const [viewMode, setViewMode] = useState<"pdf" | "text">(
+    data.pdfBase64 ? "pdf" : "text"
+  );
   const [search, setSearch] = useState("");
-  const [showLineNumbers, setShowLineNumbers] = useState(true);
-  const [selectedLines, setSelectedLines] = useState<Set<number>>(new Set());
+  const [rangeStart, setRangeStart] = useState<number | null>(null);
+  const [rangeEnd, setRangeEnd] = useState<number | null>(null);
   const [step, setStep] = useState<"select" | "preview">("select");
   const [extractedTxns, setExtractedTxns] = useState<RawTransaction[]>([]);
+  const [pdfSelections, setPdfSelections] = useState<SelectionRect[]>([]);
+  const [extracting, setExtracting] = useState(false);
+  const lastClickedRef = useRef<number | null>(null);
 
   const filteredLines = useMemo(() => {
     if (!search.trim())
@@ -134,7 +519,6 @@ export default function PDFVisualizer({
       .filter(({ line }) => line.toLowerCase().includes(lower));
   }, [data.rawLines, search]);
 
-  // Highlight lines that look like they might contain transaction data
   const isTransactionLike = (line: string): boolean => {
     const hasAmount = /\$?\d{1,3}(?:,\d{3})*\.\d{2}/.test(line);
     const hasDate =
@@ -144,64 +528,135 @@ export default function PDFVisualizer({
     return hasAmount && hasDate;
   };
 
-  const hasAmountPattern = (line: string): boolean => {
-    return /\$?\d{1,3}(?:,\d{3})*\.\d{2}/.test(line);
-  };
+  const hasAmountPattern = (line: string): boolean =>
+    /\$?\d{1,3}(?:,\d{3})*\.\d{2}/.test(line);
 
-  const txLikeCount = useMemo(
-    () => data.rawLines.filter(isTransactionLike).length,
-    [data.rawLines]
+  const isInRange = useCallback(
+    (idx: number): boolean => {
+      if (rangeStart === null) return false;
+      if (rangeEnd === null) return idx === rangeStart;
+      const lo = Math.min(rangeStart, rangeEnd);
+      const hi = Math.max(rangeStart, rangeEnd);
+      return idx >= lo && idx <= hi;
+    },
+    [rangeStart, rangeEnd]
   );
 
-  const toggleLine = useCallback((idx: number) => {
-    setSelectedLines((prev) => {
-      const next = new Set(prev);
-      if (next.has(idx)) {
-        next.delete(idx);
-      } else {
-        next.add(idx);
-      }
-      return next;
-    });
-  }, []);
+  const selectedCount = useMemo(() => {
+    if (rangeStart === null) return 0;
+    if (rangeEnd === null) return 1;
+    return Math.abs(rangeEnd - rangeStart) + 1;
+  }, [rangeStart, rangeEnd]);
 
-  const selectAllLikely = useCallback(() => {
-    const likely = new Set<number>();
-    data.rawLines.forEach((line, idx) => {
-      if (isTransactionLike(line)) likely.add(idx);
-    });
-    setSelectedLines(likely);
-  }, [data.rawLines]);
+  const handleLineClick = useCallback(
+    (idx: number, shiftKey: boolean) => {
+      if (rangeStart === null || !shiftKey) {
+        setRangeStart(idx);
+        setRangeEnd(null);
+        lastClickedRef.current = idx;
+      } else {
+        setRangeEnd(idx);
+        lastClickedRef.current = idx;
+      }
+    },
+    [rangeStart]
+  );
 
   const clearSelection = useCallback(() => {
-    setSelectedLines(new Set());
+    setRangeStart(null);
+    setRangeEnd(null);
+    setPdfSelections([]);
   }, []);
 
-  const handleExtract = useCallback(() => {
-    const lines = Array.from(selectedLines)
-      .sort((a, b) => a - b)
-      .map((idx) => data.rawLines[idx]);
+  const autoDetectSection = useCallback(() => {
+    const txLines: number[] = [];
+    data.rawLines.forEach((line, idx) => {
+      if (isTransactionLike(line)) txLines.push(idx);
+    });
+    if (txLines.length === 0) return;
+    setRangeStart(txLines[0]);
+    setRangeEnd(txLines[txLines.length - 1]);
+  }, [data.rawLines]);
 
+  // Handle PDF visual selection - accumulate selections (multiple per page allowed)
+  const handlePdfSelection = useCallback(
+    async (sel: SelectionRect) => {
+      setPdfSelections((prev) => [...prev, sel].sort((a, b) => a.page - b.page));
+    },
+    []
+  );
+
+  // Extract transactions from all PDF selections
+  const handlePdfExtract = useCallback(async () => {
+    if (!data.pdfBase64 || pdfSelections.length === 0) return;
+
+    setExtracting(true);
+    try {
+      const allLines: string[] = [];
+      // Process each selection in page order
+      for (const sel of pdfSelections) {
+        const lines = await extractTextFromRegion(data.pdfBase64!, sel);
+        allLines.push(...lines);
+      }
+
+      // Clean OCR artifacts from all extracted lines
+      const cleanedLines = allLines.map(cleanOcrLine);
+      console.log("[PDFVisualizer] Extracted lines (cleaned):", cleanedLines);
+
+      // First try: parse as a bank table (with header detection)
+      let txns = parseBankTable(cleanedLines);
+
+      // Fallback: parse each line individually
+      if (txns.length === 0) {
+        for (const line of cleanedLines) {
+          const tx = extractTransactionFromLine(line);
+          if (tx) txns.push(tx);
+        }
+      }
+
+      setExtractedTxns(txns);
+      setStep("preview");
+    } catch (err) {
+      console.error("[PDFVisualizer] Extract failed:", err);
+    } finally {
+      setExtracting(false);
+    }
+  }, [data.pdfBase64, pdfSelections]);
+
+  // Handle text-mode extract
+  const handleTextExtract = useCallback(() => {
+    if (rangeStart === null) return;
+    const lo = rangeEnd !== null ? Math.min(rangeStart, rangeEnd) : rangeStart;
+    const hi = rangeEnd !== null ? Math.max(rangeStart, rangeEnd) : rangeStart;
+    const sectionLines = data.rawLines.slice(lo, hi + 1);
     const txns: RawTransaction[] = [];
-    for (const line of lines) {
+    for (const line of sectionLines) {
       const tx = extractTransactionFromLine(line);
       if (tx) txns.push(tx);
     }
-
     setExtractedTxns(txns);
     setStep("preview");
-  }, [selectedLines, data.rawLines]);
+  }, [rangeStart, rangeEnd, data.rawLines]);
 
   const handleConfirm = useCallback(() => {
     if (extractedTxns.length === 0) return;
 
-    // Save the pattern to localStorage for future parsing
-    const selectedLineTexts = Array.from(selectedLines)
-      .sort((a, b) => a - b)
-      .map((idx) => data.rawLines[idx]);
+    // Get the lines for pattern learning
+    let sectionLines: string[] = [];
+    if (viewMode === "text" && rangeStart !== null) {
+      const lo =
+        rangeEnd !== null ? Math.min(rangeStart, rangeEnd) : rangeStart;
+      const hi =
+        rangeEnd !== null ? Math.max(rangeStart, rangeEnd) : rangeStart;
+      sectionLines = data.rawLines.slice(lo, hi + 1);
+    } else {
+      // Use extracted txn descriptions as sample lines
+      sectionLines = extractedTxns.map(
+        (tx) => `${tx.date} ${tx.description} ${tx.amount}`
+      );
+    }
 
-    const pattern = buildPatternFromLines(selectedLineTexts);
-
+    const pattern = buildPatternFromLines(sectionLines);
     try {
       const stored = localStorage.getItem("budget-categorizer-custom-patterns");
       const patterns = stored ? JSON.parse(stored) : {};
@@ -209,7 +664,7 @@ export default function PDFVisualizer({
         bankId: data.bankDetected,
         dateRegex: pattern.dateRegex,
         amountRegex: pattern.amountRegex,
-        sampleLines: selectedLineTexts.slice(0, 5),
+        sampleLines: sectionLines.slice(0, 5),
         createdAt: Date.now(),
       };
       localStorage.setItem(
@@ -217,68 +672,87 @@ export default function PDFVisualizer({
         JSON.stringify(patterns)
       );
     } catch {
-      // localStorage not available, skip saving
+      // ignore
     }
 
     onTransactionsExtracted(extractedTxns, data.bankDetected);
-  }, [extractedTxns, selectedLines, data, onTransactionsExtracted]);
+  }, [
+    extractedTxns,
+    viewMode,
+    rangeStart,
+    rangeEnd,
+    data,
+    onTransactionsExtracted,
+  ]);
 
   const handleBack = useCallback(() => {
     setStep("select");
   }, []);
 
+  // ─── Preview Step ───────────────────────────────────────────────
   if (step === "preview") {
     return (
-      <div className="bg-white rounded-xl border border-amber-200 shadow-sm overflow-hidden">
-        {/* Preview Header */}
+      <div className="bg-white rounded-xl border border-emerald-200 shadow-sm overflow-hidden">
         <div className="bg-emerald-50 border-b border-emerald-200 px-5 py-4">
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex items-start gap-3">
-              <div className="mt-0.5 p-2 bg-emerald-100 rounded-lg">
-                <svg
-                  className="w-5 h-5 text-emerald-600"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
-                  />
-                </svg>
-              </div>
-              <div>
-                <h3 className="text-sm font-semibold text-emerald-900">
-                  Extracted {extractedTxns.length} transaction
-                  {extractedTxns.length !== 1 ? "s" : ""} from{" "}
-                  {selectedLines.size} selected line
-                  {selectedLines.size !== 1 ? "s" : ""}
-                </h3>
-                <p className="text-xs text-emerald-700 mt-1">
-                  Review the extracted transactions below. If they look correct,
-                  click &quot;Confirm &amp; Use&quot; to add them. The pattern
-                  will be saved for future statements from this bank.
-                </p>
-              </div>
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 p-2 bg-emerald-100 rounded-lg">
+              <svg
+                className="w-5 h-5 text-emerald-600"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                />
+              </svg>
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-emerald-900">
+                Found {extractedTxns.length} transaction
+                {extractedTxns.length !== 1 ? "s" : ""} in selected zone
+              </h3>
+              <p className="text-xs text-emerald-700 mt-1">
+                Review below. Click &quot;Confirm &amp; Learn&quot; to use these
+                and teach the app this format.
+              </p>
             </div>
           </div>
         </div>
 
-        {/* Extracted Transactions Table */}
         <div className="max-h-[400px] overflow-y-auto">
           {extractedTxns.length === 0 ? (
             <div className="px-5 py-8 text-center text-gray-400">
-              <p>Could not extract valid transactions from the selected lines.</p>
+              <svg
+                className="w-10 h-10 mx-auto mb-3 text-gray-300"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={1.5}
+                  d="M9.75 9.75l4.5 4.5m0-4.5l-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                />
+              </svg>
+              <p className="font-medium text-gray-500">
+                No transactions found in the selected zone
+              </p>
               <p className="mt-1 text-xs">
-                Try selecting different lines that contain dates and amounts.
+                Try selecting a different area with dates and dollar amounts.
               </p>
             </div>
           ) : (
             <table className="w-full text-sm">
               <thead className="bg-gray-50 sticky top-0">
                 <tr>
+                  <th className="text-left px-4 py-2 text-xs font-medium text-gray-500">
+                    #
+                  </th>
                   <th className="text-left px-4 py-2 text-xs font-medium text-gray-500">
                     Date
                   </th>
@@ -293,8 +767,11 @@ export default function PDFVisualizer({
               <tbody className="divide-y divide-gray-100">
                 {extractedTxns.map((tx, idx) => (
                   <tr key={idx} className="hover:bg-gray-50">
+                    <td className="px-4 py-2 text-xs text-gray-400">
+                      {idx + 1}
+                    </td>
                     <td className="px-4 py-2 text-xs text-gray-600 whitespace-nowrap">
-                      {tx.date || "—"}
+                      {tx.date || "\u2014"}
                     </td>
                     <td className="px-4 py-2 text-xs text-gray-800 max-w-[300px] truncate">
                       {tx.description}
@@ -317,13 +794,25 @@ export default function PDFVisualizer({
           )}
         </div>
 
-        {/* Action Buttons */}
         <div className="px-5 py-3 bg-gray-50 border-t border-gray-100 flex items-center justify-between">
           <button
             onClick={handleBack}
-            className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-200 rounded-lg transition-colors"
+            className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-200 rounded-lg transition-colors flex items-center gap-1"
           >
-            &larr; Back to selection
+            <svg
+              className="w-4 h-4"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M15 19l-7-7 7-7"
+              />
+            </svg>
+            Adjust selection
           </button>
           <div className="flex items-center gap-3">
             <button
@@ -350,8 +839,7 @@ export default function PDFVisualizer({
                     d="M5 13l4 4L19 7"
                   />
                 </svg>
-                Confirm &amp; Use {extractedTxns.length} Transaction
-                {extractedTxns.length !== 1 ? "s" : ""}
+                Confirm &amp; Learn ({extractedTxns.length})
               </button>
             )}
           </div>
@@ -360,85 +848,14 @@ export default function PDFVisualizer({
     );
   }
 
+  // ─── Selection Step ─────────────────────────────────────────────
   return (
     <div className="bg-white rounded-xl border border-amber-200 shadow-sm overflow-hidden">
-      {/* Header */}
-      <div className="bg-amber-50 border-b border-amber-200 px-5 py-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="flex items-start gap-3">
-            <div className="mt-0.5 p-2 bg-amber-100 rounded-lg">
-              <svg
-                className="w-5 h-5 text-amber-600"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"
-                />
-              </svg>
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold text-amber-900">
-                No transactions auto-detected &mdash; Select them manually
-              </h3>
-              <p className="text-xs text-amber-700 mt-1">
-                Click on the lines below that contain your transactions. The app
-                will learn this format for future{" "}
-                <span className="font-medium">
-                  {data.bankDetected === "unknown"
-                    ? "PDF"
-                    : data.bankDetected.toUpperCase()}
-                </span>{" "}
-                statements.
-              </p>
-              <div className="flex items-center gap-4 mt-2 text-xs text-amber-600">
-                <span>{data.rawLines.length} lines extracted</span>
-                <span>&middot;</span>
-                <span>
-                  {txLikeCount} lines look like potential transactions
-                </span>
-                {selectedLines.size > 0 && (
-                  <>
-                    <span>&middot;</span>
-                    <span className="font-semibold text-[#0f3460]">
-                      {selectedLines.size} selected
-                    </span>
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
-          <button
-            onClick={onDismiss}
-            className="p-1.5 text-amber-400 hover:text-amber-600 hover:bg-amber-100 rounded-lg transition-colors"
-            title="Dismiss"
-          >
-            <svg
-              className="w-5 h-5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M6 18L18 6M6 6l12 12"
-              />
-            </svg>
-          </button>
-        </div>
-      </div>
-
-      {/* Toolbar */}
-      <div className="px-5 py-3 border-b border-gray-100 flex items-center gap-3 flex-wrap">
-        <div className="relative flex-1 min-w-[200px] max-w-sm">
+      {/* PDF Submitted Banner */}
+      <div className="bg-[#0f3460] text-white px-5 py-3 flex items-center gap-3">
+        <div className="p-1.5 bg-white/20 rounded-lg">
           <svg
-            className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
+            className="w-5 h-5"
             fill="none"
             stroke="currentColor"
             viewBox="0 0 24 24"
@@ -447,127 +864,327 @@ export default function PDFVisualizer({
               strokeLinecap="round"
               strokeLinejoin="round"
               strokeWidth={2}
-              d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
             />
           </svg>
-          <input
-            type="text"
-            placeholder="Search text..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="w-full pl-9 pr-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-300 focus:border-amber-300"
-          />
         </div>
+        <div className="flex-1">
+          <h3 className="text-sm font-semibold">PDF Submitted</h3>
+          <p className="text-xs text-white/70">
+            {data.bankDetected !== "unknown"
+              ? `Detected as ${data.bankDetected.toUpperCase()} statement`
+              : "Bank format not recognized"}{" "}
+            &middot; {data.rawLines.length} lines of text extracted
+          </p>
+        </div>
+
+        {/* View Mode Toggle */}
+        {data.pdfBase64 && (
+          <div className="flex bg-white/10 rounded-lg p-0.5">
+            <button
+              onClick={() => setViewMode("pdf")}
+              className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                viewMode === "pdf"
+                  ? "bg-white text-[#0f3460]"
+                  : "text-white/70 hover:text-white"
+              }`}
+            >
+              PDF View
+            </button>
+            <button
+              onClick={() => setViewMode("text")}
+              className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                viewMode === "text"
+                  ? "bg-white text-[#0f3460]"
+                  : "text-white/70 hover:text-white"
+              }`}
+            >
+              Text View
+            </button>
+          </div>
+        )}
 
         <button
-          onClick={selectAllLikely}
-          className="px-3 py-1.5 text-xs bg-green-50 text-green-700 border border-green-200 rounded-lg hover:bg-green-100 transition-colors"
+          onClick={onDismiss}
+          className="p-1.5 text-white/50 hover:text-white hover:bg-white/10 rounded-lg transition-colors"
+          title="Dismiss"
         >
-          Auto-select likely
-        </button>
-        {selectedLines.size > 0 && (
-          <button
-            onClick={clearSelection}
-            className="px-3 py-1.5 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+          <svg
+            className="w-5 h-5"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
           >
-            Clear selection
-          </button>
-        )}
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M6 18L18 6M6 6l12 12"
+            />
+          </svg>
+        </button>
+      </div>
 
-        <label className="flex items-center gap-2 text-xs text-gray-500 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={showLineNumbers}
-            onChange={(e) => setShowLineNumbers(e.target.checked)}
-            className="rounded border-gray-300 text-amber-500 focus:ring-amber-300"
-          />
-          Line #
-        </label>
-
-        <div className="flex items-center gap-1.5 ml-auto">
-          <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
-            <span className="w-3 h-3 rounded bg-green-100 border border-green-300 inline-block" />
-            Likely
-          </span>
-          <span className="inline-flex items-center gap-1.5 text-xs text-gray-500 ml-2">
-            <span className="w-3 h-3 rounded bg-blue-50 border border-blue-200 inline-block" />
-            Amount
-          </span>
-          <span className="inline-flex items-center gap-1.5 text-xs text-gray-500 ml-2">
-            <span className="w-3 h-3 rounded bg-[#0f3460]/10 border border-[#0f3460]/30 inline-block" />
-            Selected
-          </span>
+      {/* Selector Instructions */}
+      <div className="bg-amber-50 border-b border-amber-200 px-5 py-3">
+        <div className="flex items-center gap-3">
+          <div className="p-1.5 bg-amber-100 rounded-lg flex-shrink-0">
+            <svg
+              className="w-4 h-4 text-amber-600"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122"
+              />
+            </svg>
+          </div>
+          <div className="flex-1">
+            {viewMode === "pdf" ? (
+              <p className="text-xs text-amber-800">
+                <span className="font-semibold">Selector Tool:</span>{" "}
+                <span className="font-medium">Click and drag</span> a rectangle
+                over the transactions section in the PDF. The app will extract
+                and learn this format.
+              </p>
+            ) : (
+              <p className="text-xs text-amber-800">
+                <span className="font-semibold">Selector Tool:</span>{" "}
+                <span className="font-medium">Click</span> the first
+                transaction line, then{" "}
+                <span className="font-medium">Shift+Click</span> the last one
+                to highlight the section.
+              </p>
+            )}
+          </div>
+          {pdfSelections.length > 0 && viewMode === "pdf" && (
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <span className="px-2.5 py-1 bg-[#0f3460] text-white text-xs font-semibold rounded-full">
+                {pdfSelections.length} zone{pdfSelections.length !== 1 ? "s" : ""}
+              </span>
+              <button
+                onClick={clearSelection}
+                className="px-2 py-1 text-xs text-gray-500 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
+                title="Clear all zones"
+              >
+                Reset
+              </button>
+            </div>
+          )}
+          {selectedCount > 0 && viewMode === "text" && (
+            <span className="flex-shrink-0 px-2.5 py-1 bg-[#0f3460] text-white text-xs font-semibold rounded-full">
+              {selectedCount} lines
+            </span>
+          )}
         </div>
       </div>
 
-      {/* Lines */}
-      <div className="max-h-[500px] overflow-y-auto font-mono text-xs">
-        {filteredLines.length === 0 ? (
-          <div className="px-5 py-8 text-center text-gray-400">
-            {search
-              ? "No lines match your search"
-              : "No text extracted from PDF"}
-          </div>
-        ) : (
-          <div className="divide-y divide-gray-50">
-            {filteredLines.map(({ line, originalIdx }) => {
-              const isTx = isTransactionLike(line);
-              const hasAmt = !isTx && hasAmountPattern(line);
-              const isSelected = selectedLines.has(originalIdx);
+      {/* PDF View Mode */}
+      {viewMode === "pdf" && data.pdfBase64 && (
+        <>
+          {extracting ? (
+            <div className="px-5 py-12 text-center">
+              <div className="w-8 h-8 border-2 border-[#0f3460] border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+              <p className="text-sm text-gray-500">
+                Extracting transactions from selected zone...
+              </p>
+            </div>
+          ) : (
+            <PDFPageRenderer
+              pdfBase64={data.pdfBase64}
+              onSelectionComplete={handlePdfSelection}
+              selections={pdfSelections}
+            />
+          )}
+        </>
+      )}
 
-              return (
-                <div
-                  key={originalIdx}
-                  onClick={() => toggleLine(originalIdx)}
-                  className={`flex items-start cursor-pointer transition-colors ${
-                    isSelected
-                      ? "bg-[#0f3460]/10 border-l-4 border-l-[#0f3460]"
-                      : isTx
-                      ? "bg-green-50/60 hover:bg-green-100/60 border-l-4 border-l-transparent"
-                      : hasAmt
-                      ? "bg-blue-50/40 hover:bg-blue-100/40 border-l-4 border-l-transparent"
-                      : "hover:bg-gray-50 border-l-4 border-l-transparent"
-                  }`}
-                >
-                  {/* Checkbox */}
-                  <span className="flex-shrink-0 w-8 flex items-center justify-center py-1.5">
-                    <input
-                      type="checkbox"
-                      checked={isSelected}
-                      onChange={() => toggleLine(originalIdx)}
-                      onClick={(e) => e.stopPropagation()}
-                      className="rounded border-gray-300 text-[#0f3460] focus:ring-[#0f3460]/30 w-3.5 h-3.5"
-                    />
-                  </span>
-                  {showLineNumbers && (
-                    <span className="flex-shrink-0 w-10 px-1 py-1.5 text-right text-gray-300 select-none border-r border-gray-100">
-                      {originalIdx + 1}
-                    </span>
-                  )}
-                  <span
-                    className={`flex-1 px-3 py-1.5 whitespace-pre-wrap break-all ${
-                      line.trim() === "" ? "text-gray-300" : "text-gray-700"
-                    }`}
-                  >
-                    {line || "\u00A0"}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
+      {/* Text View Mode */}
+      {viewMode === "text" && (
+        <>
+          {/* Toolbar */}
+          <div className="px-5 py-2.5 border-b border-gray-100 flex items-center gap-3 flex-wrap">
+            <div className="relative flex-1 min-w-[180px] max-w-xs">
+              <svg
+                className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+                />
+              </svg>
+              <input
+                type="text"
+                placeholder="Search text..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="w-full pl-9 pr-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-300 focus:border-amber-300"
+              />
+            </div>
 
-      {/* Footer with action */}
+            <button
+              onClick={autoDetectSection}
+              className="px-3 py-1.5 text-xs bg-green-50 text-green-700 border border-green-200 rounded-lg hover:bg-green-100 transition-colors flex items-center gap-1.5"
+            >
+              <svg
+                className="w-3.5 h-3.5"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M13 10V3L4 14h7v7l9-11h-7z"
+                />
+              </svg>
+              Auto-detect
+            </button>
+            {selectedCount > 0 && (
+              <button
+                onClick={clearSelection}
+                className="px-3 py-1.5 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                Clear
+              </button>
+            )}
+
+            <div className="flex items-center gap-2 ml-auto text-xs text-gray-400">
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded bg-green-100 border border-green-300 inline-block" />
+                Likely
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-2.5 h-2.5 rounded bg-[#0f3460]/15 border border-[#0f3460]/40 inline-block" />
+                Selected
+              </span>
+            </div>
+          </div>
+
+          {/* Lines */}
+          <div className="max-h-[450px] overflow-y-auto font-mono text-xs">
+            {filteredLines.length === 0 ? (
+              <div className="px-5 py-8 text-center text-gray-400">
+                {search
+                  ? "No lines match your search"
+                  : "No text extracted from PDF"}
+              </div>
+            ) : (
+              <div>
+                {filteredLines.map(({ line, originalIdx }) => {
+                  const isTx = isTransactionLike(line);
+                  const hasAmt = !isTx && hasAmountPattern(line);
+                  const inRange = isInRange(originalIdx);
+                  const isRangeEdge =
+                    originalIdx === rangeStart || originalIdx === rangeEnd;
+
+                  return (
+                    <div
+                      key={originalIdx}
+                      onClick={(e) =>
+                        handleLineClick(originalIdx, e.shiftKey)
+                      }
+                      className={`flex items-start cursor-pointer transition-all border-l-4 ${
+                        inRange
+                          ? isRangeEdge
+                            ? "bg-[#0f3460]/15 border-l-[#0f3460] ring-1 ring-inset ring-[#0f3460]/20"
+                            : "bg-[#0f3460]/8 border-l-[#0f3460]/60"
+                          : isTx
+                          ? "bg-green-50/50 hover:bg-green-100/50 border-l-green-400/40"
+                          : hasAmt
+                          ? "bg-blue-50/30 hover:bg-blue-50/60 border-l-transparent"
+                          : "hover:bg-gray-50 border-l-transparent"
+                      }`}
+                    >
+                      <span className="flex-shrink-0 w-12 px-2 py-1 text-right text-gray-300 select-none border-r border-gray-100 tabular-nums">
+                        {originalIdx + 1}
+                      </span>
+                      <span
+                        className={`flex-1 px-3 py-1 whitespace-pre-wrap break-all ${
+                          line.trim() === ""
+                            ? "text-gray-300"
+                            : inRange
+                            ? "text-gray-900"
+                            : "text-gray-600"
+                        }`}
+                      >
+                        {line || "\u00A0"}
+                      </span>
+                      {inRange && isRangeEdge && (
+                        <span className="flex-shrink-0 px-2 py-1 text-[10px] font-semibold text-[#0f3460] select-none">
+                          {originalIdx ===
+                          Math.min(rangeStart!, rangeEnd ?? rangeStart!)
+                            ? "START"
+                            : "END"}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* Footer */}
       <div className="px-5 py-3 bg-gray-50 border-t border-gray-100 flex items-center justify-between">
-        <p className="text-xs text-gray-500">
-          <span className="font-medium">Tip:</span> Click lines containing
-          transactions, then extract them. The format will be remembered.
+        <p className="text-xs text-gray-400">
+          {viewMode === "pdf" ? (
+            pdfSelections.length > 0 ? (
+              <>
+                <span className="text-[#0f3460] font-medium">
+                  {pdfSelections.length} zone
+                  {pdfSelections.length !== 1 ? "s" : ""} on page
+                  {pdfSelections.length === 1
+                    ? ` ${pdfSelections[0].page}`
+                    : `s ${pdfSelections.map((s) => s.page).join(", ")}`}
+                  .
+                </span>{" "}
+                Navigate to other pages to add more zones.
+              </>
+            ) : (
+              <>Draw a rectangle over the transactions area in the PDF</>
+            )
+          ) : selectedCount === 0 ? (
+            <>Click a line to start selecting the transactions section</>
+          ) : selectedCount === 1 ? (
+            <>
+              <span className="text-[#0f3460] font-medium">Start set.</span>{" "}
+              Now hold{" "}
+              <kbd className="px-1 py-0.5 bg-gray-200 rounded text-[10px] font-mono">
+                Shift
+              </kbd>{" "}
+              and click the last transaction line.
+            </>
+          ) : (
+            <>
+              Lines{" "}
+              <span className="font-medium text-gray-600">
+                {Math.min(rangeStart!, rangeEnd!) + 1}
+              </span>{" "}
+              to{" "}
+              <span className="font-medium text-gray-600">
+                {Math.max(rangeStart!, rangeEnd!) + 1}
+              </span>{" "}
+              selected ({selectedCount} lines)
+            </>
+          )}
         </p>
-        {selectedLines.size > 0 && (
+        {viewMode === "pdf" && pdfSelections.length > 0 && (
           <button
-            onClick={handleExtract}
-            className="px-5 py-2 text-sm bg-[#0f3460] text-white rounded-lg hover:bg-[#16213e] transition-colors font-medium flex items-center gap-2"
+            onClick={handlePdfExtract}
+            className="px-5 py-2 text-sm bg-[#0f3460] text-white rounded-lg hover:bg-[#16213e] transition-colors font-medium flex items-center gap-2 shadow-sm"
           >
             <svg
               className="w-4 h-4"
@@ -579,11 +1196,32 @@ export default function PDFVisualizer({
                 strokeLinecap="round"
                 strokeLinejoin="round"
                 strokeWidth={2}
-                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"
+                d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
               />
             </svg>
-            Extract {selectedLines.size} Line
-            {selectedLines.size !== 1 ? "s" : ""}
+            Extract from {pdfSelections.length} Zone
+            {pdfSelections.length !== 1 ? "s" : ""}
+          </button>
+        )}
+        {viewMode === "text" && selectedCount > 0 && (
+          <button
+            onClick={handleTextExtract}
+            className="px-5 py-2 text-sm bg-[#0f3460] text-white rounded-lg hover:bg-[#16213e] transition-colors font-medium flex items-center gap-2 shadow-sm"
+          >
+            <svg
+              className="w-4 h-4"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
+              />
+            </svg>
+            Extract Transactions
           </button>
         )}
       </div>

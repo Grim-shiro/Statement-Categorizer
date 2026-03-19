@@ -1,4 +1,5 @@
-export const CATEGORIES = [
+/** Default categories (read-only). Custom categories are added separately and persisted. */
+export const DEFAULT_CATEGORIES = [
   "Rent",
   "Utilities",
   "Payroll",
@@ -13,10 +14,22 @@ export const CATEGORIES = [
   "Vehicle & Fuel",
   "Bank Fees",
   "Taxes",
+  "Owner Deposits",
+  "Owner Draws",
   "Other",
 ] as const;
 
-export type Category = (typeof CATEGORIES)[number];
+/** @deprecated Use DEFAULT_CATEGORIES for the default list; Category is now string to allow custom categories. */
+export const CATEGORIES = DEFAULT_CATEGORIES;
+
+/** Category is a string (default or custom). Stored and displayed in normalized Title Case. */
+export type Category = string;
+
+/** Stored custom category: key for dedupe, label for display. */
+export interface CustomCategoryEntry {
+  key: string;
+  label: string;
+}
 
 export interface RawTransaction {
   date: string;

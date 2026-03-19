@@ -1,11 +1,32 @@
 import { RawTransaction } from "@/types";
 import { maskSensitiveData } from "./maskSensitive";
 
+// ─── Server-side OCR fallback ─────────────────────────────────────
+// Server-side OCR disabled — too heavy for serverless (causes stack overflow).
+// The client-side PDF Visualizer handles OCR via Tesseract.js in the browser.
+async function serverOCR(_buffer: Buffer): Promise<string> {
+  return "";
+}
+
 // ─── Bank Detection ───────────────────────────────────────────────
-type BankType = "cibc-credit" | "cibc-bank" | "bmo" | "eq" | "rbc-credit" | "rbc-chequing" | "chase" | "scotiabank" | "scotiabank-bank" | "unknown";
+type BankType = "cibc-credit" | "cibc-bank" | "bmo" | "eq" | "rbc-credit" | "rbc-chequing" | "chase" | "scotiabank" | "scotiabank-bank" | "td-credit" | "td-bank" | "unknown";
 
 function detectBank(text: string): BankType {
   const lower = text.toLowerCase();
+
+  // TD: check for credit card statements (TD Cash Back, TD Visa, etc.)
+  // PDF text extraction may compress spaces: "tdcashback", "tdcanadatrust"
+  if ((lower.includes("td cash back") || lower.includes("tdcashback") ||
+       lower.includes("td visa") || lower.includes("td first class") || lower.includes("tdfirstclass") ||
+       lower.includes("td aeroplan") || lower.includes("tdaeroplan") ||
+       lower.includes("td rewards") || lower.includes("td platinum")) &&
+      (lower.includes("td canada trust") || lower.includes("tdcanadatrust") || lower.includes("toronto-dominion")))
+    return "td-credit";
+
+  // TD bank account (chequing/savings): "Statement of Account" + "Toronto-Dominion"
+  if ((lower.includes("statement of account") || lower.includes("statementofaccount")) &&
+      (lower.includes("toronto-dominion") || lower.includes("td canada trust") || lower.includes("tdcanadatrust")))
+    return "td-bank";
 
   // Scotiabank: differentiate credit card vs bank account
   // Check bank account first (has compressed "Here'swhathappened" format)
@@ -48,17 +69,33 @@ function isTableHeader(line: string): boolean {
 }
 
 // ─── Common Helpers ───────────────────────────────────────────────
+// Terms that indicate a line is a total/summary/header, not a transaction. All parsers use this
+// so total, debit, and credit summary rows are never parsed as transactions.
+// Skip only when description is clearly a total/summary row — not when it merely contains a word (e.g. "Payroll Total" is valid).
 const SKIP_DESC_TERMS = [
-  "balance", "total", "opening", "closing", "previous", "new balance",
-  "beginning", "ending", "statement", "payment due", "due date",
+  "opening balance", "closing balance", "previous balance", "new balance", "total balance", "account balance",
+  "opening", "closing", "previous", "beginning", "ending", "statement", "payment due", "due date",
   "minimum payment", "credit limit", "available credit",
   "interest charge", "annual fee", "rewards", "points earned",
   "summary", "sub-total", "closing totals", "opening totals",
+  "total debits", "total credits", "total withdrawals", "total deposits",
+  "debits total", "credits total", "withdrawals total", "deposits total",
+  "total amount", "grand total", "total fees", "total interest",
+  "number of debits", "number of credits", "number of transactions",
 ];
 
 function isSkipDescription(desc: string): boolean {
-  const lower = desc.toLowerCase();
+  const lower = desc.toLowerCase().trim();
+  if (!lower) return true;
   return SKIP_DESC_TERMS.some((term) => lower.includes(term));
+}
+
+/** True if line looks like a total/summary row (e.g. "Total Debits", "Closing Balance"). Use to skip, not parse as txn. */
+function isTotalOrSummaryLine(line: string): boolean {
+  const t = line.trim().toLowerCase();
+  return /^(total\s+(debits|credits|withdrawals|deposits|amount|balance|fees|interest)|debits\s+total|credits\s+total|withdrawals\s+total|deposits\s+total|sub[- ]?total|grand\s+total|number\s+of\s+(debits|credits|transactions)|closing\s+balance|opening\s+balance|new\s+balance)\b/.test(
+    t
+  );
 }
 
 function parseAmountStr(s: string): number {
@@ -120,6 +157,7 @@ function parseScotiabank(lines: string[], year: number): RawTransaction[] {
   const txns: RawTransaction[] = [];
 
   for (const line of lines) {
+    if (isTotalOrSummaryLine(line)) continue;
     // Must start with 3-digit ref number
     if (!/^\d{3}(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i.test(line)) continue;
 
@@ -138,7 +176,8 @@ function parseScotiabank(lines: string[], year: number): RawTransaction[] {
 
     let amount = parseAmountStr(amountMatch[1]);
     if (isNaN(amount) || amount === 0) continue;
-    if (amountMatch[2] === "-") amount = -amount; // Credit/payment
+    // Debit (charge) = negative, Credit (payment/refund) = positive. Trailing "-" on statement = credit.
+    if (amountMatch[2] !== "-") amount = -amount; // Debit/charge: store as negative
 
     // Description: everything between the second date and the amount
     // Format: "001Jan 13Jan 13PAYMENT FROM..." — skip ref(3) + date1 + date2
@@ -156,6 +195,361 @@ function parseScotiabank(lines: string[], year: number): RawTransaction[] {
   }
 
   return txns;
+}
+
+// ─── TD Compressed Description Splitter ──────────────────────────
+// TD PDF text extraction concatenates words: "RELIANCEHOMECOMFORTTORONTO"
+// This function tries to restore reasonable spacing using common word patterns.
+// If the text already has spaces, it returns as-is.
+
+function splitCompressedTDDesc(text: string): string {
+  // If there are already spaces, just return trimmed
+  if (/\s/.test(text)) return text.trim();
+
+  // Insert space before known city names that appear at end of descriptions
+  const CITIES = /(?=(?:TORONTO|MONTREAL|VANCOUVER|OTTAWA|CALGARY|EDMONTON|WINNIPEG|HALIFAX|VICTORIA|MISSISSAUGA|BRAMPTON|MARKHAM|RICHMOND|BURNABY|SURREY|LONDON|HAMILTON|KITCHENER|WINDSOR|SASKATOON|REGINA|QUEBEC|GATINEAU|BARRIE|OSHAWA|GUELPH))/gi;
+  let result = text.replace(CITIES, " ");
+
+  // Insert space before common words/tokens
+  const WORDS = /(?=(?:HOME|COMFORT|GENERAL|INSURANCE|INTEREST|PAYMENT|CREDIT|DEBIT|TRANSFER|ONLINE|PURCHASE|RETAIL|SERVICE|CHARGE|ANNUAL|MONTHLY|REFUND|RETURN|DEPOSIT|WITHDRAWAL|FROM|THANK|AUTO|PAY|BILL|GAS|HYDRO|ELECTRIC|WATER|PHONE|MOBILE|WIRELESS|INTERNET|CABLE|GROCERY|MARKET|STORE|SHOP|BANK|TRUST|CANADA|FINANCIAL))/gi;
+  result = result.replace(WORDS, " ");
+
+  // Clean up multiple spaces
+  return result.replace(/\s+/g, " ").trim();
+}
+
+// ─── TD Credit Card Parser ───────────────────────────────────────
+// PDF text extraction gives compressed format:
+// "DEC19DEC22$51.98RELIANCEHOMECOMFORTTORONTO"
+// Two dates (txn+posting), $amount, then description (no spaces)
+// Also handles spaced format: "DEC 19 DEC 22 RELIANCE HOME COMFORT TORONTO $51.98"
+
+function parseTDCredit(lines: string[], year: number): RawTransaction[] {
+  const txns: RawTransaction[] = [];
+  let inSection = false;
+
+  const MONTH = "(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)";
+
+  // Compressed format: "DEC19DEC22$51.98RELIANCEHOMECOMFORTTORONTO"
+  const COMPRESSED_RE = new RegExp(
+    `^(${MONTH})\\s*(\\d{1,2})\\s*${MONTH}\\s*\\d{1,2}\\s*\\$([\\d,]+\\.\\d{2})(.+)$`,
+    "i"
+  );
+
+  // Spaced format: "DEC 19 DEC 22 RELIANCE HOME COMFORT TORONTO $51.98"
+  const SPACED_RE = new RegExp(
+    `^(${MONTH})\\s+(\\d{1,2})\\s+${MONTH}\\s+\\d{1,2}\\s+(.+?)\\s+\\$([\\d,]+\\.\\d{2})\\s*$`,
+    "i"
+  );
+
+  for (const line of lines) {
+    // Start parsing after common header patterns
+    if (/ACTIVITY\s*DESCRIPTION\s*AMOUNT/i.test(line) ||
+        /TRANSACTION\s*POSTING/i.test(line) ||
+        /PREVIOUS\s*STATEMENT\s*BALANCE/i.test(line)) {
+      inSection = true;
+      // PREVIOUS STATEMENT BALANCE is also a skip line, so just mark inSection and continue
+      if (/PREVIOUS\s*STATEMENT/i.test(line)) continue;
+      continue;
+    }
+    if (!inSection) continue;
+    if (isTotalOrSummaryLine(line)) continue;
+
+    // Stop markers
+    if (/TD\s*MESSAGE\s*CENTRE/i.test(line)) break;
+    if (/What\s*is\s*the\s*minimum/i.test(line)) break;
+    if (/SPECIAL\s*OFFERS/i.test(line)) break;
+
+    // Skip summary lines
+    if (/TOTAL\s*NEW\s*BALANCE/i.test(line)) continue;
+    if (/NEW\s*BALANCE/i.test(line) && !new RegExp(MONTH, "i").test(line)) continue;
+    if (/CALCULATING/i.test(line)) { inSection = false; continue; }
+    if (/PAYMENT\s*INFORMATION/i.test(line)) { inSection = false; continue; }
+
+    let monthStr: string | undefined;
+    let dayStr: string | undefined;
+    let description: string | undefined;
+    let amountStr: string | undefined;
+
+    // Try compressed format first (most common from pdf-parse)
+    const cm = line.match(COMPRESSED_RE);
+    if (cm) {
+      monthStr = cm[1];
+      dayStr = cm[2];
+      amountStr = cm[3];
+      // Description is compressed — try to restore spaces
+      // TD compressed text is all-caps with no spaces: "RELIANCEHOMECOMFORTTORONTO"
+      // Use known word boundaries from common merchant names
+      description = splitCompressedTDDesc(cm[4].trim());
+    } else {
+      // Try spaced format
+      const sm = line.match(SPACED_RE);
+      if (sm) {
+        monthStr = sm[1];
+        dayStr = sm[2];
+        description = sm[3].trim();
+        amountStr = sm[4];
+      }
+    }
+
+    if (!monthStr || !dayStr || !description || !amountStr) continue;
+    if (isSkipDescription(description)) continue;
+
+    const date = parseMonthDayDate(`${monthStr} ${dayStr}`, year);
+    if (!date) continue;
+
+    const amount = parseAmountStr(amountStr);
+    if (isNaN(amount) || amount === 0) continue;
+
+    // Credit card: positive amounts are charges (expenses = negative)
+    // Payments/credits typically show with CR or negative
+    txns.push({ date, description, amount: -amount });
+  }
+
+  return txns;
+}
+
+// ─── TD Bank Account Parser ──────────────────────────────────────
+// Compressed: "ELEXICONU3H4Z9377.23SEP02" or "TDMORTGAGE2,280.17SEP023,059.82"
+// Strategy: find date (MMMDD) as anchor, extract ALL amount candidates before it.
+// Then use known balance anchors (starting balance + explicit balance columns)
+// to solve for the correct (candidate, sign) combination per transaction.
+// This handles reference number digit bleed (e.g. "K992.08" where K9 is ref, amount=92.08).
+
+function parseTDBank(lines: string[], year: number): RawTransaction[] {
+  const DEBUG = false; // TD parser debug logging
+  const MONTH_RE = /(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}/i;
+
+  interface TDParsed {
+    date: string;
+    beforeDate: string; // raw text before date, used to derive description from chosen candidate
+    candidates: { value: number; start: number; prefixDigits: number }[];
+    balance: number | null;
+  }
+  const parsed: TDParsed[] = [];
+  let inSection = false;
+  let startingBalance: number | null = null;
+
+  for (const line of lines) {
+    if (/description\s*withdrawal/i.test(line) || /description\s*debit/i.test(line)) {
+      inSection = true;
+      continue;
+    }
+    if (!inSection) continue;
+    if (/account\/transaction\s*type/i.test(line) || /account\s*issued/i.test(line)) break;
+    if (isTotalOrSummaryLine(line)) continue;
+    if (/closing\s*balance/i.test(line)) continue;
+
+    // Starting balance: "STARTINGBALANCEAUG292,768.02"
+    if (/starting\s*balance/i.test(line)) {
+      const m = line.match(/([\d,]+\.\d{2})\s*$/);
+      if (m) startingBalance = parseFloat(m[1].replace(/,/g, ""));
+      continue;
+    }
+
+    // Pure total/summary line (two amounts concatenated, no description)
+    if (/^[\d,]+\.\d{2}[\d,]+\.\d{2}\s*$/.test(line)) continue;
+
+    // Find date position (MMMDD) in line
+    const dateMatch = line.match(MONTH_RE);
+    if (!dateMatch) continue;
+
+    const datePos = line.indexOf(dateMatch[0]);
+    const monthStr = dateMatch[0].substring(0, 3);
+    const dayStr = dateMatch[0].substring(3);
+
+    const date = parseMonthDayDate(`${monthStr} ${dayStr}`, year);
+    if (!date) continue;
+
+    const beforeDate = line.substring(0, datePos);
+    const afterDate = line.substring(datePos + dateMatch[0].length).trim();
+
+    // Extract balance from after-date portion
+    // TD statements may concatenate amounts after the date: e.g. "5,000.003,010.77"
+    // where the first number is a deposit/withdrawal amount and the LAST is the running balance.
+    // Always use the LAST number as the balance (rightmost column).
+    let balance: number | null = null;
+    if (afterDate) {
+      const allNums = afterDate.match(/[\d,]+\.\d{2}/g);
+      if (allNums && allNums.length > 0) {
+        balance = parseFloat(allNums[allNums.length - 1].replace(/,/g, ""));
+      }
+    }
+
+    // Extract ALL amount candidates — we'll pick the right one using balance anchors
+    const candidates = extractBMOAmountCandidates(beforeDate).filter(c => c.value > 0);
+    if (candidates.length === 0) continue;
+
+    parsed.push({ date, beforeDate, candidates, balance });
+  }
+
+  if (DEBUG) {
+    console.log("=== TD PARSER DEBUG ===");
+    console.log("Starting balance:", startingBalance);
+    console.log("Total parsed transactions:", parsed.length);
+    for (let i = 0; i < parsed.length; i++) {
+      const tx = parsed[i];
+      console.log(`  [${i}] date=${tx.date} beforeDate="${tx.beforeDate}" balance=${tx.balance} candidates=${JSON.stringify(tx.candidates.map(c => ({ val: c.value, prefDig: c.prefixDigits })))}`);
+    }
+  }
+
+  if (parsed.length === 0) return [];
+
+  // ── Helper: derive description from beforeDate and chosen candidate ──
+  function descFromCandidate(beforeDate: string, start: number): string {
+    return beforeDate.substring(0, start)
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+      .trim();
+  }
+
+  // ── Anchor-based solving ──
+  // Anchors: known balance points (starting balance + explicit balance columns)
+  const anchors: { idx: number; bal: number }[] = [];
+  if (startingBalance !== null) anchors.push({ idx: -1, bal: startingBalance });
+  for (let i = 0; i < parsed.length; i++) {
+    if (parsed[i].balance !== null) anchors.push({ idx: i, bal: parsed[i].balance! });
+  }
+
+  // For each transaction: chosen amount and sign. Default: largest clean candidate, withdrawal.
+  const chosen: { amount: number; candidateIdx: number }[] = parsed.map(tx => {
+    const clean = tx.candidates.filter(c => c.prefixDigits < 5);
+    const pool = clean.length > 0 ? clean : tx.candidates;
+    const best = pool[pool.length - 1];
+    return { amount: best.value, candidateIdx: tx.candidates.indexOf(best) };
+  });
+  // Heuristic sign: +1 for likely deposits, -1 for likely withdrawals
+  function heuristicSign(tx: TDParsed): number {
+    const desc = descFromCandidate(tx.beforeDate, tx.candidates[0].start).toLowerCase();
+    if (/e-?transfer|deposit|received|credit|refund|rebate|payroll|salary|income|interest|cashback|cash\s*back|reversal|reimbursement|dividend|transfer\s*in|tfr\s*in/i.test(desc)) return 1;
+    return -1;
+  }
+  const signs: number[] = parsed.map(tx => heuristicSign(tx));
+
+  if (DEBUG) {
+    console.log("Anchors:", JSON.stringify(anchors));
+    console.log("Heuristic signs:", signs.join(", "));
+  }
+
+  // Solve each segment between consecutive anchors:
+  // Try all (candidate, sign) combinations to find one matching the balance delta
+  for (let a = 0; a < anchors.length - 1; a++) {
+    const startIdx = anchors[a].idx + 1;
+    const endIdx = anchors[a + 1].idx;
+    const prevBal = anchors[a].bal;
+    const nextBal = anchors[a + 1].bal;
+    const requiredDelta = Math.round((nextBal - prevBal) * 100) / 100;
+
+    const segTxns: TDParsed[] = [];
+    for (let i = startIdx; i <= endIdx; i++) segTxns.push(parsed[i]);
+    const n = segTxns.length;
+    if (n === 0) continue;
+
+    // Check if total search space is feasible (each tx: candidates × 2 signs)
+    let totalCombos = 1;
+    for (const tx of segTxns) totalCombos *= tx.candidates.length * 2;
+
+    if (DEBUG) {
+      console.log(`  Segment a=${a}: indices ${startIdx}..${endIdx}, prevBal=${prevBal}, nextBal=${nextBal}, delta=${requiredDelta}, n=${n}, combos=${totalCombos}`);
+    }
+
+    if (totalCombos <= 200000 && n <= 25) {
+      // Iterative stack-based search: try all (candidate, sign) combinations
+      const bestResult: { candidateIdx: number; sign: number }[] = new Array(n);
+      let solved = false;
+
+      // Pre-compute heuristic signs for each tx in the segment
+      const segHeuristics: number[] = segTxns.map(tx => heuristicSign(tx));
+
+      // Build options for each transaction: array of {candidateIdx, sign, delta}
+      // Ordered so heuristic-expected sign comes first
+      const options: { ci: number; sign: number; delta: number }[][] = [];
+      for (let i = 0; i < n; i++) {
+        const tx = segTxns[i];
+        const expected = segHeuristics[i];
+        const txOptions: { ci: number; sign: number; delta: number }[] = [];
+        for (let ci = 0; ci < tx.candidates.length; ci++) {
+          const val = tx.candidates[ci].value;
+          txOptions.push({ ci, sign: expected, delta: expected * val });
+          txOptions.push({ ci, sign: -expected, delta: -expected * val });
+        }
+        options.push(txOptions);
+      }
+
+      // Iterative DFS using an explicit stack (avoids call stack overflow)
+      const optionIdx = new Int32Array(n); // which option we're trying at each level
+      const sums = new Float64Array(n + 1); // cumulative sums; sums[0] = 0
+      sums[0] = 0;
+      let level = 0;
+
+      outer:
+      while (level >= 0) {
+        if (level === n) {
+          // Check solution
+          if (Math.abs(Math.round(sums[n] * 100) / 100 - requiredDelta) < 0.10) {
+            solved = true;
+            break outer;
+          }
+          // Solution didn't match, backtrack: move to next option at previous level
+          level--;
+          if (level >= 0) optionIdx[level]++;
+          continue;
+        }
+
+        const oi = optionIdx[level];
+        if (oi >= options[level].length) {
+          // Exhausted all options at this level, backtrack
+          optionIdx[level] = 0;
+          level--;
+          if (level >= 0) optionIdx[level]++;
+          continue;
+        }
+
+        // Try this option and descend
+        const opt = options[level][oi];
+        bestResult[level] = { candidateIdx: opt.ci, sign: opt.sign };
+        sums[level + 1] = sums[level] + opt.delta;
+        level++;
+      }
+
+      if (DEBUG) console.log(`    Solved: ${solved}`);
+      if (solved) {
+        for (let i = 0; i < n; i++) {
+          const txIdx = startIdx + i;
+          const ci = bestResult[i].candidateIdx;
+          chosen[txIdx] = { amount: segTxns[i].candidates[ci].value, candidateIdx: ci };
+          signs[txIdx] = bestResult[i].sign;
+          if (DEBUG) console.log(`    [${txIdx}] candidate=${segTxns[i].candidates[ci].value} sign=${bestResult[i].sign}`);
+        }
+      }
+    } else {
+      if (DEBUG) console.log(`    SKIPPED (too many combos or too many txns)`);
+    }
+  }
+
+  if (DEBUG) {
+    console.log("=== AFTER SOLVING ===");
+    for (let i = 0; i < parsed.length; i++) {
+      const tx = parsed[i];
+      const desc = descFromCandidate(tx.beforeDate, tx.candidates[chosen[i].candidateIdx].start);
+      console.log(`  [${i}] desc="${desc}" amount=${chosen[i].amount} sign=${signs[i]} final=${Math.round(signs[i] * chosen[i].amount * 100) / 100}`);
+    }
+  }
+
+  // Build final result
+  const result: RawTransaction[] = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const tx = parsed[i];
+    const desc = descFromCandidate(tx.beforeDate, tx.candidates[chosen[i].candidateIdx].start);
+    if (!desc || isSkipDescription(desc)) continue;
+    result.push({
+      date: tx.date,
+      description: desc,
+      amount: Math.round(signs[i] * chosen[i].amount * 100) / 100,
+    });
+  }
+
+  return result;
 }
 
 // ─── CIBC Bank Parser ─────────────────────────────────────────────
@@ -186,20 +580,25 @@ function parseCIBCBank(lines: string[], year: number): RawTransaction[] {
 
     if (isSkipDescription(description)) return;
 
-    // Extract amounts: first is withdrawal/deposit, last is balance
-    const amounts = amountLine.match(/\$?[\d,]+\.\d{2}/g);
-    if (!amounts || amounts.length === 0) return;
+    // Extract amounts: first is usually withdrawal/deposit, last is balance (description digits can add extra matches)
+    const amountStrs = amountLine.match(/\$?[\d,]+\.\d{2}/g);
+    if (!amountStrs || amountStrs.length === 0) return;
 
-    let amount = parseAmountStr(amounts[0]);
+    const balance = amountStrs.length >= 2 ? parseAmountStr(amountStrs[amountStrs.length - 1]) : null;
+    // When we have balance + prevBalance, pick the amount that matches the balance change (avoids description-embedded numbers)
+    let amount = parseAmountStr(amountStrs[0]);
+    if (prevBalance !== null && balance !== null && amountStrs.length >= 2) {
+      const expectedAmount = Math.abs(prevBalance - balance);
+      const match = amountStrs.slice(0, -1).find((s) => Math.abs(parseAmountStr(s) - expectedAmount) < 0.02);
+      if (match !== undefined) amount = parseAmountStr(match);
+    }
     if (isNaN(amount) || amount === 0) return;
 
     // Determine credit vs debit from balance change
-    const balance = amounts.length >= 2 ? parseAmountStr(amounts[amounts.length - 1]) : null;
     if (prevBalance !== null && balance !== null) {
       if (balance < prevBalance) {
         amount = -amount; // Withdrawal/debit
       }
-      // If balance went up, it's a deposit/credit (positive)
     }
     if (balance !== null) prevBalance = balance;
 
@@ -215,6 +614,7 @@ function parseCIBCBank(lines: string[], year: number): RawTransaction[] {
     }
     if (!inSection) continue;
     if (/^important:/i.test(line) || /this statement/i.test(line)) break;
+    if (isTotalOrSummaryLine(line)) continue; // Skip total debits/credits/balance rows
     if (/^\d{5}[A-Z]/.test(line) || /^page/i.test(line)) continue;
 
     // Skip sub-detail lines (fee breakdowns like CAPPED MONTHLY FEE$16.95)
@@ -270,121 +670,300 @@ function isValidCommaAmount(s: string): boolean {
   return /^\d{1,3}(,\d{3})*\.\d{2}$/.test(s);
 }
 
-function extractBMOAmountFromSegment(segText: string): { value: number; start: number } | null {
+function extractBMOAmountCandidates(segText: string): { value: number; start: number; prefixDigits: number }[] {
   const dotPos = segText.lastIndexOf(".");
-  if (dotPos < 1 || dotPos + 3 > segText.length) return null;
+  if (dotPos < 1 || dotPos + 3 > segText.length) return [];
 
-  const candidates: { value: number; start: number }[] = [];
+  const candidates: { value: number; start: number; prefixDigits: number }[] = [];
   for (let start = dotPos - 1; start >= Math.max(0, dotPos - 10); start--) {
     const candidate = segText.substring(start, dotPos + 3);
     if (/^\d{1,3}\.\d{2}$/.test(candidate) || isValidCommaAmount(candidate)) {
-      candidates.push({ value: parseFloat(candidate.replace(/,/g, "")), start });
+      // Count how many consecutive digits precede this candidate (reference number bleed)
+      let prefixDigits = 0;
+      for (let p = start - 1; p >= 0; p--) {
+        if (/\d/.test(segText[p])) prefixDigits++;
+        else break;
+      }
+      candidates.push({ value: parseFloat(candidate.replace(/,/g, "")), start, prefixDigits });
     }
     if (start > 0 && !/[\d,]/.test(segText[start - 1])) break;
   }
-  if (candidates.length === 0) return null;
+  return candidates;
+}
 
-  // Pick largest candidate ≤ $50K
+function pickBMOAmount(
+  candidates: { value: number; start: number; prefixDigits?: number }[],
+  balance: number,
+  prevBalance: number | null
+): { value: number; start: number } | null {
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  // Use balance column to validate: |prevBalance ± amount| = balance (debit: prev - amount = balance; credit: prev + amount = balance)
+  if (prevBalance !== null) {
+    const expectedAmount = Math.abs(prevBalance - balance);
+    const balanceMatch = candidates.find(
+      (c) => Math.abs(c.value - expectedAmount) < 0.02
+    );
+    if (balanceMatch) return balanceMatch;
+  }
+
+  // Fallback: prefer candidates that aren't bleeding into a reference number.
+  // If a candidate has 5+ prefix digits, it's likely consuming part of a reference
+  // number (e.g., "05748108" Moneris merchant ID) — prefer candidates with fewer prefix digits.
   const reasonable = candidates.filter((c) => c.value <= 50000);
-  return reasonable.length > 0 ? reasonable[reasonable.length - 1] : candidates[0];
+  if (reasonable.length === 0) return candidates[0];
+
+  // Find the candidate where prefix digits drop below 5 (clean boundary)
+  const clean = reasonable.filter((c) => (c.prefixDigits ?? 0) < 5);
+  if (clean.length > 0) return clean[clean.length - 1]; // largest clean candidate
+
+  return reasonable[reasonable.length - 1];
+}
+
+/** Returns single amount from segment (rightmost candidate). Use pickBMOAmount with balance for BMO. */
+function extractBMOAmountFromSegment(segText: string): { value: number; start: number } | null {
+  const c = extractBMOAmountCandidates(segText);
+  return c.length ? c[0] : null;
+}
+
+/** Strip trailing amount-like number from description (e.g. ",1,005.03" or "1,005.03") so it isn't shown as text. */
+function stripTrailingAmountFromDescription(desc: string): string {
+  return desc.replace(/,?\s*\d{1,3}(,\d{3})*\.\d{2}\s*$/, "").trim();
+}
+
+interface BMOParsedTxn {
+  date: string;
+  description: string;
+  amount: number;
+  balance: number;
 }
 
 function parseBMO(lines: string[], year: number): RawTransaction[] {
-  const txns: RawTransaction[] = [];
+  const parsed: BMOParsedTxn[] = [];
   let inSection = false;
   let prevBalance: number | null = null;
+  let pendingDate: string | null = null;
+  let pendingAfterDate = "";
 
-  for (const line of lines) {
-    if (/here.?s\s*what\s*happened/i.test(line) || /amounts?\s*deducted/i.test(line)) {
-      inSection = true;
-      continue;
-    }
-    if (!inSection) continue;
-    if (/please\s*report/i.test(line) || /trade-?marks/i.test(line)) break;
-    if (/^page/i.test(line) || /owners?:/i.test(line) || /^miss/i.test(line) || /primary/i.test(line) || /continued/i.test(line)) continue;
-
-    const dateMatch = line.match(/^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))(\d{1,2})/i);
-    if (!dateMatch) continue;
-
-    const date = parseMonthDayDate(`${dateMatch[1]} ${dateMatch[2]}`, year);
-    if (!date) continue;
-
-    const afterDate = line.substring(dateMatch[0].length);
-
-    // Find all ".XX" positions to split into segments
+  function processOneLine(
+    dateStr: string,
+    afterDate: string,
+    yearNum: number,
+    descriptionOverride?: string
+  ): boolean {
     const dotPositions: number[] = [];
     for (let i = 0; i < afterDate.length - 2; i++) {
       if (afterDate[i] === "." && /\d/.test(afterDate[i + 1]) && /\d/.test(afterDate[i + 2])) {
         dotPositions.push(i);
       }
     }
-
-    // Opening/closing balance lines have only 1 amount — capture for debit/credit tracking
     if (dotPositions.length === 1 && /opening|closing|balance/i.test(afterDate)) {
       const m = afterDate.match(/(\d[\d,]*\.\d{2})/);
       if (m) prevBalance = parseFloat(m[1].replace(/,/g, ""));
-      continue;
+      return true;
     }
-    if (dotPositions.length < 2) continue;
+    if (dotPositions.length < 2) return false;
 
-    // Split into segments at .XX boundaries
     const segments: { text: string; start: number; end: number }[] = [];
     for (let i = 0; i < dotPositions.length; i++) {
       const segStart = i === 0 ? 0 : dotPositions[i - 1] + 3;
       const segEnd = dotPositions[i] + 3;
       segments.push({ text: afterDate.substring(segStart, segEnd), start: segStart, end: segEnd });
     }
+    const lastSeg = segments[segments.length - 1];
+    const txSeg = segments[segments.length - 2];
 
-    // Extract amounts from last 2-3 segments
-    const amounts: { value: number; start: number; end: number }[] = [];
-    for (let i = segments.length - 1; i >= Math.max(0, segments.length - 3); i--) {
-      const seg = segments[i];
-
-      if (i > 0) {
-        const m = seg.text.match(/^(\d[\d,]*\.\d{2})$/);
-        if (m && (isValidCommaAmount(m[1]) || /^\d{1,3}\.\d{2}$/.test(m[1]))) {
-          amounts.unshift({ value: parseFloat(m[1].replace(/,/g, "")), start: seg.start, end: seg.end });
-          continue;
-        }
+    function parseSegmentValue(seg: { text: string }, allowNegative = false): number | null {
+      const re = allowNegative ? /^(-?\d[\d,]*\.\d{2})$/ : /^(\d[\d,]*\.\d{2})$/;
+      const m = seg.text.match(re);
+      if (m) {
+        const s = m[1].replace(/,/g, "");
+        if (isValidCommaAmount(m[1].replace("-", "")) || /^-?\d{1,3}\.\d{2}$/.test(m[1]) || /^\d{1,3}\.\d{2}$/.test(m[1]))
+          return parseFloat(s);
       }
+      const cands = extractBMOAmountCandidates(seg.text);
+      return cands.length > 0 ? cands[cands.length - 1].value : null;
+    }
 
-      const match = extractBMOAmountFromSegment(seg.text);
-      if (match) {
-        amounts.unshift({ value: match.value, start: seg.start + match.start, end: seg.end });
+    const lastVal = parseSegmentValue(lastSeg, true);
+    const txSegValClean = txSeg.text.match(/^(\d[\d,]*\.\d{2})$/);
+    const txSegSingle =
+      txSegValClean && (isValidCommaAmount(txSegValClean[1]) || /^\d{1,3}\.\d{2}$/.test(txSegValClean[1]))
+        ? parseFloat(txSegValClean[1].replace(/,/g, ""))
+        : null;
+    const txCandidates = txSegSingle != null ? [] : extractBMOAmountCandidates(txSeg.text);
+
+    let balanceValue: number;
+    let txAmountValue: number;
+    let txAmountStart: number;
+    let txAmountEnd: number;
+    let descriptionEnd: number;
+
+    if (lastVal == null) return false;
+
+    const tryOrder = (balance: number, amount: number) =>
+      prevBalance == null || Math.abs(Math.abs(prevBalance - balance) - amount) < 0.02;
+
+    const amountFromTxSeg =
+      txSegSingle ?? (pickBMOAmount(txCandidates, lastVal, prevBalance)?.value ?? null);
+    if (amountFromTxSeg != null && tryOrder(lastVal, amountFromTxSeg)) {
+      balanceValue = lastVal;
+      txAmountValue = amountFromTxSeg;
+      if (txSegSingle != null) {
+        txAmountStart = txSeg.start;
+        txAmountEnd = txSeg.end;
+      } else {
+        const picked = pickBMOAmount(txCandidates, lastVal, prevBalance);
+        if (!picked) return false;
+        txAmountStart = txSeg.start + picked.start;
+        txAmountEnd = txSeg.end;
+      }
+      descriptionEnd = txAmountStart;
+    } else {
+      const secondVal = parseSegmentValue(txSeg);
+      if (secondVal != null && tryOrder(secondVal, lastVal)) {
+        balanceValue = secondVal;
+        txAmountValue = lastVal;
+        txAmountStart = lastSeg.start;
+        txAmountEnd = lastSeg.end;
+        descriptionEnd = lastSeg.start;
+      } else {
+        balanceValue = lastVal;
+        const picked =
+          txSegSingle != null
+            ? { value: txSegSingle, start: 0 }
+            : pickBMOAmount(txCandidates, lastVal, prevBalance);
+        if (picked == null) return false;
+        txAmountValue = picked.value;
+        txAmountStart = txSeg.start + picked.start;
+        txAmountEnd = txSeg.end;
+        descriptionEnd = txAmountStart;
       }
     }
 
-    if (amounts.length < 2) continue;
+    // If we still don't have a previous balance (first transaction), make sure
+    // we are not accidentally using the running balance as the amount. When
+    // balanceValue === txAmountValue with multiple segments, prefer a value
+    // from the transaction segment rather than the balance segment.
+    if (prevBalance === null && Math.abs(balanceValue - txAmountValue) < 0.02 && segments.length >= 2) {
+      const alt = extractBMOAmountCandidates(txSeg.text);
+      if (alt.length > 0) {
+        txAmountValue = alt[alt.length - 1].value;
+      }
+    }
 
-    const txAmount = amounts[amounts.length - 2];
-    const balance = amounts[amounts.length - 1].value;
-    let description = afterDate.substring(0, txAmount.start)
-      .replace(/([a-z])([A-Z])/g, "$1 $2")
-      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-      .trim();
+    const balance = balanceValue;
+    let description =
+      descriptionOverride !== undefined
+        ? descriptionOverride.trim()
+        : afterDate.substring(0, descriptionEnd)
+            .replace(/([a-z])([A-Z])/g, "$1 $2")
+            .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+            .trim();
+    description = stripTrailingAmountFromDescription(description);
 
     if (!description || isSkipDescription(description)) {
-      // Still track balance for opening/closing rows
-      prevBalance = amounts[amounts.length - 1].value;
-      continue;
+      prevBalance = balance;
+      return true;
     }
-    if (isNaN(txAmount.value) || txAmount.value === 0) continue;
+    // When we have a previous balance, amount must be the balance change (never the running balance)
+    const amountFromBalanceChange =
+      prevBalance !== null ? Math.abs(prevBalance - balance) : null;
+    const amountToUse =
+      amountFromBalanceChange !== null && amountFromBalanceChange >= 0.01
+        ? amountFromBalanceChange
+        : txAmountValue;
+    if (isNaN(amountToUse) || amountToUse === 0) return true;
 
-    // Determine debit vs credit by comparing balance change
-    let signedAmount = txAmount.value;
-    if (prevBalance !== null) {
-      // If balance went down, it's a debit (negative)
-      // If balance went up, it's a credit (positive)
-      if (balance < prevBalance) {
-        signedAmount = -txAmount.value;
-      }
-    }
-
+    let signedAmount = amountToUse;
+    if (prevBalance !== null && balance < prevBalance) signedAmount = -amountToUse;
     prevBalance = balance;
-    txns.push({ date, description, amount: signedAmount });
+    parsed.push({ date: dateStr, description, amount: signedAmount, balance });
+    return true;
   }
 
-  return txns;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (
+      /here.?s\s*what\s*happened/i.test(line) ||
+      /amounts?\s*deduct(ed|ions)/i.test(line) ||
+      /amounts?\s*debit(ed)?/i.test(line) ||
+      /(?:opening|closing)\s*balance/i.test(line) ||
+      /^date\s*description\s*(from|amount)/i.test(line) ||
+      /transaction\s*details/i.test(line)
+    ) {
+      inSection = true;
+    }
+    if (!inSection) continue;
+    if (/please\s*report/i.test(line) || /trade-?marks/i.test(line)) break;
+    if (/^page/i.test(line) || /owners?:/i.test(line) || /^miss/i.test(line) || /primary/i.test(line) || /continued/i.test(line)) continue;
+    if (isTotalOrSummaryLine(line)) continue;
+
+    // Standalone opening/previous balance line (no date) so first transaction can use balance-change amount
+    if (/^(opening|previous|beginning)\s*balance/i.test(line)) {
+      const m = line.match(/(\d[\d,]*\.\d{2})/);
+      if (m) prevBalance = parseFloat(m[1].replace(/,/g, ""));
+      continue;
+    }
+
+    const dateMatch = line.match(/^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))(\d{1,2})/i);
+    if (dateMatch) {
+      if (!inSection) inSection = true;
+      const date = parseMonthDayDate(`${dateMatch[1]} ${dateMatch[2]}`, year);
+      if (!date) continue;
+
+      const afterDate = line.substring(dateMatch[0].length);
+      const dotPositions: number[] = [];
+      for (let j = 0; j < afterDate.length - 2; j++) {
+        if (afterDate[j] === "." && /\d/.test(afterDate[j + 1]) && /\d/.test(afterDate[j + 2])) dotPositions.push(j);
+      }
+
+      if (dotPositions.length === 1 && /opening|closing|balance/i.test(afterDate)) {
+        const m = afterDate.match(/(\d[\d,]*\.\d{2})/);
+        if (m) prevBalance = parseFloat(m[1].replace(/,/g, ""));
+        pendingDate = null;
+        pendingAfterDate = "";
+        continue;
+      }
+      if (dotPositions.length >= 2) {
+        pendingDate = null;
+        pendingAfterDate = "";
+        processOneLine(date, afterDate, year);
+        continue;
+      }
+      pendingDate = date;
+      pendingAfterDate = afterDate.trim();
+      continue;
+    }
+
+    if (pendingDate !== null && pendingAfterDate !== "") {
+      const isAmountLine = /^-?[\d,\s.]+$/.test(line.trim()) && /\d+\.\d{2}/.test(line);
+      if (isAmountLine) {
+        const amountLine = line.trim();
+        const d = pendingDate;
+        const descOnly = pendingAfterDate;
+        pendingDate = null;
+        pendingAfterDate = "";
+        processOneLine(d, amountLine, year, descOnly);
+      } else if (!/^\d{5,}$/.test(line.trim())) {
+        pendingAfterDate = (pendingAfterDate + " " + line.trim()).trim();
+      }
+    }
+  }
+
+  // ── Second pass: recompute amounts from balance differences ──
+  // Balance differences are always accurate since the balance column is unambiguous.
+  for (let i = 1; i < parsed.length; i++) {
+    const balanceDiff = Math.abs(parsed[i - 1].balance - parsed[i].balance);
+    if (balanceDiff >= 0.01) {
+      const sign = parsed[i].balance < parsed[i - 1].balance ? -1 : 1;
+      parsed[i].amount = Math.round(sign * balanceDiff * 100) / 100;
+    }
+  }
+
+  return parsed.map(({ date, description, amount }) => ({ date, description, amount }));
 }
 
 // ─── EQ Bank Parser ──────────────────────────────────────────────
@@ -404,6 +983,7 @@ function parseEQBank(lines: string[], year: number): RawTransaction[] {
       continue;
     }
     if (!inSection) continue;
+    if (isTotalOrSummaryLine(line)) continue;
     if (/^january|^february|^march|^april|^may|^june|^july|^august|^september|^october|^november|^december/i.test(line) && /statement/i.test(line)) continue;
     if (/bills\s*account/i.test(line)) continue;
 
@@ -458,6 +1038,7 @@ function parseRBCCredit(lines: string[], year: number): RawTransaction[] {
       continue;
     }
     if (!inSection) continue;
+    if (isTotalOrSummaryLine(line)) continue;
     if (/TOTAL\s*ACCOUNT\s*BALANCE/i.test(line)) { inSection = false; continue; }
     if (/^\d+\s*OF\s*\d+$/i.test(line)) continue; // Page number
     if (/continued/i.test(line) || /STATEMENT FROM/i.test(line)) continue;
@@ -535,6 +1116,7 @@ function parseRBCChequing(lines: string[], year: number): RawTransaction[] {
   let pendingDesc = "";
 
   // Process a single transaction entry (description + amounts concatenated)
+  // Uses balance-based amount picking (like BMO) so description-embedded numbers (e.g. Moneris refs) are not used as amounts.
   function processEntry(text: string) {
     if (!lastDate) return;
 
@@ -555,20 +1137,47 @@ function parseRBCChequing(lines: string[], year: number): RawTransaction[] {
       segments.push({ text: text.substring(segStart, segEnd), start: segStart, end: segEnd });
     }
 
-    // Extract amounts from last segments
     const amounts: { value: number; start: number; end: number }[] = [];
-    for (let si = segments.length - 1; si >= Math.max(0, segments.length - 3); si--) {
-      const seg = segments[si];
-      if (si > 0) {
-        const m = seg.text.match(/^(\d[\d,]*\.\d{2})$/);
-        if (m && (isValidCommaAmount(m[1]) || /^\d{1,3}\.\d{2}$/.test(m[1]))) {
-          amounts.unshift({ value: parseFloat(m[1].replace(/,/g, "")), start: seg.start, end: seg.end });
-          continue;
+    let balanceValue: number | null = null;
+
+    // 1) Balance from last segment
+    const lastSeg = segments[segments.length - 1];
+    const lastClean = lastSeg.text.match(/^(\d[\d,]*\.\d{2})$/);
+    if (lastClean && (isValidCommaAmount(lastClean[1]) || /^\d{1,3}\.\d{2}$/.test(lastClean[1]))) {
+      balanceValue = parseFloat(lastClean[1].replace(/,/g, ""));
+      amounts.push({ value: balanceValue, start: lastSeg.start, end: lastSeg.end });
+    } else {
+      const lastCandidates = extractBMOAmountCandidates(lastSeg.text);
+      if (lastCandidates.length === 0) return;
+      const balanceCand = lastCandidates[lastCandidates.length - 1];
+      balanceValue = balanceCand.value;
+      amounts.push({ value: balanceValue, start: lastSeg.start + balanceCand.start, end: lastSeg.end });
+    }
+
+    // 2) Tx amount from second-to-last segment (balance-validated)
+    if (segments.length >= 2 && balanceValue !== null) {
+      const txSeg = segments[segments.length - 2];
+      const txClean = txSeg.text.match(/^(\d[\d,]*\.\d{2})$/);
+      if (txClean && (isValidCommaAmount(txClean[1]) || /^\d{1,3}\.\d{2}$/.test(txClean[1]))) {
+        amounts.unshift({ value: parseFloat(txClean[1].replace(/,/g, "")), start: txSeg.start, end: txSeg.end });
+      } else {
+        const txCandidates = extractBMOAmountCandidates(txSeg.text);
+        const picked = pickBMOAmount(txCandidates, balanceValue, prevBalance);
+        if (picked) {
+          amounts.unshift({ value: picked.value, start: txSeg.start + picked.start, end: txSeg.end });
         }
       }
-      const match = extractBMOAmountFromSegment(seg.text);
-      if (match) {
-        amounts.unshift({ value: match.value, start: seg.start + match.start, end: seg.end });
+    }
+
+    // 3) Optional third-to-last segment
+    if (segments.length >= 3) {
+      const seg = segments[segments.length - 3];
+      const m = seg.text.match(/^(\d[\d,]*\.\d{2})$/);
+      if (m && (isValidCommaAmount(m[1]) || /^\d{1,3}\.\d{2}$/.test(m[1]))) {
+        amounts.unshift({ value: parseFloat(m[1].replace(/,/g, "")), start: seg.start, end: seg.end });
+      } else {
+        const match = extractBMOAmountFromSegment(seg.text);
+        if (match) amounts.unshift({ value: match.value, start: seg.start + match.start, end: seg.end });
       }
     }
 
@@ -621,6 +1230,7 @@ function parseRBCChequing(lines: string[], year: number): RawTransaction[] {
 
     if (/Details of your account activity/i.test(line)) { inSection = true; continue; }
     if (!inSection) continue;
+    if (isTotalOrSummaryLine(line)) continue;
     if (/Please check this/i.test(line) || /^Closing Balance/i.test(line)) break;
     if (/continued/i.test(line) || /^\d+ of \d+$/i.test(line)) continue;
     if (/^Date\s*Description/i.test(line)) continue;
@@ -691,6 +1301,7 @@ function parseGeneric(lines: string[], year: number): RawTransaction[] {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    if (isTotalOrSummaryLine(line)) continue; // Skip total debits/credits/balance rows
 
     if (isTableHeader(line)) {
       inTransactionSection = true;
@@ -743,14 +1354,18 @@ function parseGeneric(lines: string[], year: number): RawTransaction[] {
     const amountMatches = amountSource.match(/-?\$?[\d,]+\.\d{2}/g);
     if (!amountMatches || amountMatches.length === 0) continue;
 
-    const firstAmountIdx = amountSource.indexOf(amountMatches[0]);
-    const description = amountSource.substring(0, firstAmountIdx).trim();
+    // Prefer last amount (most statements put amount at end); avoids description-embedded numbers (e.g. Moneris refs)
+    const chosenMatch = amountMatches[amountMatches.length - 1];
+    const lastAmountIdx = amountSource.lastIndexOf(chosenMatch);
+    const description = amountSource.substring(0, lastAmountIdx).trim();
 
     if (!description || isSkipDescription(description)) continue;
     if (/^\d{6,}$/.test(description.replace(/\s/g, ""))) continue;
 
-    const amount = parseAmountStr(amountMatches[0]);
+    const amount = parseAmountStr(chosenMatch);
     if (isNaN(amount) || amount === 0) continue;
+    // Reject amounts that look like reference/account numbers (e.g. 05748108.00)
+    if (Math.abs(amount) > 999_999) continue;
 
     txns.push({ date: dateStr, description, amount });
   }
@@ -776,15 +1391,37 @@ export async function parsePDFWithDetails(buffer: Buffer): Promise<PDFParseResul
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pdfParseModule = require("pdf-parse");
   const pdfParse = (typeof pdfParseModule === "function" ? pdfParseModule : pdfParseModule.default) as (buf: Buffer) => Promise<{ text: string }>;
-  const data = await pdfParse(buffer);
-  const text = data.text;
-  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  let data = await pdfParse(buffer);
+  let text = data.text;
+  let lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  // If pdf-parse returned no text, try server-side OCR via Tesseract
+  if (lines.length === 0) {
+    console.log("[pdfParser] pdf-parse returned 0 lines, trying server-side OCR...");
+    try {
+      const ocrText = await serverOCR(buffer);
+      if (ocrText.trim()) {
+        text = ocrText;
+        lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+        console.log(`[pdfParser] OCR extracted ${lines.length} lines`);
+      }
+    } catch (err) {
+      console.error("[pdfParser] Server OCR failed:", err);
+    }
+  }
+
   const bank = detectBank(text);
   const year = extractYear(text);
 
   let transactions: RawTransaction[];
 
   switch (bank) {
+    case "td-credit":
+      transactions = parseTDCredit(lines, year);
+      break;
+    case "td-bank":
+      transactions = parseTDBank(lines, year);
+      break;
     case "scotiabank":
       transactions = parseScotiabank(lines, year);
       break;
@@ -814,10 +1451,10 @@ export async function parsePDFWithDetails(buffer: Buffer): Promise<PDFParseResul
     transactions = parseGeneric(lines, year);
   }
 
-  // Mask sensitive data (account numbers, emails, references) in all descriptions
+  // Mask sensitive data and strip trailing amount-like numbers from descriptions
   transactions = transactions.map((tx) => ({
     ...tx,
-    description: maskSensitiveData(tx.description),
+    description: stripTrailingAmountFromDescription(maskSensitiveData(tx.description)),
   }));
 
   return { transactions, bankDetected: bank, rawText: text, rawLines: lines };

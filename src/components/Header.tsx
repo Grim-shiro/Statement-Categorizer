@@ -1,5 +1,7 @@
 "use client";
 
+import { motion } from "framer-motion";
+
 interface HeaderProps {
   onSettingsClick: () => void;
   mappingsCount: number;
@@ -7,25 +9,36 @@ interface HeaderProps {
 
 export default function Header({ onSettingsClick, mappingsCount }: HeaderProps) {
   return (
-    <header className="bg-[#1a1a2e] text-white px-6 py-4 shadow-lg">
-      <div className="max-w-7xl mx-auto flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-[#e94560] rounded-lg flex items-center justify-center font-bold text-lg">
+    <motion.header
+      initial={{ y: -20, opacity: 0 }}
+      animate={{ y: 0, opacity: 1 }}
+      transition={{ duration: 0.5, ease: "easeOut" }}
+      className="bg-gradient-to-r from-[#1a1a2e] via-[#16213e] to-[#0f3460] text-white px-6 py-4 shadow-xl"
+    >
+      <div className="max-w-7xl mx-auto flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3 min-w-0">
+          <motion.div
+            whileHover={{ scale: 1.05, rotate: 2 }}
+            whileTap={{ scale: 0.95 }}
+            className="w-10 h-10 flex-shrink-0 bg-gradient-to-br from-[#e94560] to-[#c23152] rounded-lg flex items-center justify-center font-bold text-lg shadow-lg shadow-[#e94560]/30"
+          >
             BC
-          </div>
-          <div>
-            <h1 className="text-xl font-bold tracking-tight">
+          </motion.div>
+          <div className="min-w-0">
+            <h1 className="text-lg sm:text-xl font-bold tracking-tight truncate">
               Budget Categorizer
             </h1>
-            <p className="text-sm text-gray-400">
+            <p className="text-xs sm:text-sm text-gray-400 hidden sm:block">
               Smart transaction categorization for accountants
             </p>
           </div>
         </div>
 
-        <button
+        <motion.button
+          whileHover={{ scale: 1.03 }}
+          whileTap={{ scale: 0.97 }}
           onClick={onSettingsClick}
-          className="flex items-center gap-2 px-4 py-2 bg-[#16213e] hover:bg-[#0f3460] rounded-lg transition-colors text-sm"
+          className="flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors text-sm backdrop-blur-sm border border-white/10 flex-shrink-0"
         >
           <svg
             className="w-4 h-4"
@@ -48,12 +61,16 @@ export default function Header({ onSettingsClick, mappingsCount }: HeaderProps) 
           </svg>
           Learned Merchants
           {mappingsCount > 0 && (
-            <span className="bg-[#e94560] text-white text-xs px-2 py-0.5 rounded-full">
+            <motion.span
+              initial={{ scale: 0 }}
+              animate={{ scale: 1 }}
+              className="bg-[#e94560] text-white text-xs px-2 py-0.5 rounded-full shadow-sm"
+            >
               {mappingsCount}
-            </span>
+            </motion.span>
           )}
-        </button>
+        </motion.button>
       </div>
-    </header>
+    </motion.header>
   );
 }

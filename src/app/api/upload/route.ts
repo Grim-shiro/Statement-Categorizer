@@ -1,19 +1,80 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseCSV } from "@/lib/csvParser";
 import { parsePDFWithDetails } from "@/lib/pdfParser";
-import { encryptServer } from "@/lib/serverEncryption";
+import { encryptServer, decryptServer } from "@/lib/serverEncryption";
+
+/** Convert bankDetected id to a human-readable "BANK TYPE Statement" label */
+function bankLabel(bankDetected: string, txCount: number): string {
+  const BANK_LABELS: Record<string, string> = {
+    "bmo": "BMO Credit",
+    "cibc-credit": "CIBC Credit Card",
+    "cibc-bank": "CIBC Chequing",
+    "eq": "EQ Bank",
+    "rbc-credit": "RBC Credit Card",
+    "rbc-chequing": "RBC Chequing",
+    "chase": "Chase",
+    "scotiabank": "Scotiabank Credit Card",
+    "scotiabank-bank": "Scotiabank Chequing",
+    "td-credit": "TD Credit Card",
+    "td-bank": "TD Chequing/Savings",
+    "unknown": "PDF",
+  };
+  const label = BANK_LABELS[bankDetected] || bankDetected.toUpperCase();
+  return `${label} Statement (${txCount} transactions)`;
+}
 
 export async function POST(request: NextRequest) {
   try {
     const encryptionKey = request.headers.get("X-Encryption-Key");
-    const formData = await request.formData();
-    const file = formData.get("file") as File | null;
+    let filename: string;
+    let fileBuffer: Buffer | null = null;
+    let fileText: string | null = null;
 
-    if (!file) {
-      return NextResponse.json({ error: "No file provided" }, { status: 400 });
+    if (encryptionKey && request.headers.get("Content-Type")?.includes("application/json")) {
+      // E2E encrypted upload: JSON body with encrypted file data
+      const { encrypted } = await request.json();
+      const decrypted = decryptServer(encrypted, encryptionKey);
+      const { filename: fname, fileBase64 } = JSON.parse(decrypted);
+      filename = (fname || "").toLowerCase();
+      const rawBuffer = Buffer.from(fileBase64, "base64");
+
+      if (rawBuffer.length > 10 * 1024 * 1024) {
+        return NextResponse.json(
+          { error: "File size must be under 10MB" },
+          { status: 400 }
+        );
+      }
+
+      if (filename.endsWith(".csv")) {
+        fileText = rawBuffer.toString("utf-8");
+      } else if (filename.endsWith(".pdf")) {
+        fileBuffer = rawBuffer;
+      }
+    } else {
+      // Plain FormData upload (fallback)
+      const formData = await request.formData();
+      const file = formData.get("file") as File | null;
+
+      if (!file) {
+        return NextResponse.json({ error: "No file provided" }, { status: 400 });
+      }
+
+      filename = file.name.toLowerCase();
+
+      if (file.size > 10 * 1024 * 1024) {
+        return NextResponse.json(
+          { error: "File size must be under 10MB" },
+          { status: 400 }
+        );
+      }
+
+      if (filename.endsWith(".csv")) {
+        fileText = await file.text();
+      } else if (filename.endsWith(".pdf")) {
+        const arrayBuffer = await file.arrayBuffer();
+        fileBuffer = Buffer.from(arrayBuffer);
+      }
     }
-
-    const filename = file.name.toLowerCase();
 
     if (!filename.endsWith(".csv") && !filename.endsWith(".pdf")) {
       return NextResponse.json(
@@ -22,16 +83,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (file.size > 10 * 1024 * 1024) {
-      return NextResponse.json(
-        { error: "File size must be under 10MB" },
-        { status: 400 }
-      );
-    }
-
-    if (filename.endsWith(".csv")) {
-      const text = await file.text();
-      const transactions = parseCSV(text);
+    if (filename.endsWith(".csv") && fileText !== null) {
+      const transactions = parseCSV(fileText);
 
       if (transactions.length === 0) {
         return NextResponse.json(
@@ -51,17 +104,21 @@ export async function POST(request: NextRequest) {
     }
 
     // PDF parsing with details
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    if (!fileBuffer) {
+      return NextResponse.json({ error: "Failed to read PDF file" }, { status: 400 });
+    }
+    const buffer = fileBuffer;
     const result = await parsePDFWithDetails(buffer);
 
     if (result.transactions.length === 0) {
-      // Return raw lines so the client can show them for manual selection
+      // Return raw lines + PDF base64 so client can render pages for manual selection
+      const pdfBase64 = buffer.toString("base64");
       const responseData = {
         transactions: [],
         filename: "PDF Statement (0 transactions)",
         bankDetected: result.bankDetected,
         rawLines: result.rawLines,
+        pdfBase64,
         needsManualSelection: true,
       };
 
@@ -72,7 +129,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(responseData);
     }
 
-    const safeLabel = `PDF Statement (${result.transactions.length} transactions)`;
+    const safeLabel = bankLabel(result.bankDetected, result.transactions.length);
     const responseData = {
       transactions: result.transactions,
       filename: safeLabel,
