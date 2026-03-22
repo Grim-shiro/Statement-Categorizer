@@ -9,10 +9,11 @@ async function serverOCR(_buffer: Buffer): Promise<string> {
 }
 
 // ─── Bank Detection ───────────────────────────────────────────────
-type BankType = "cibc-credit" | "cibc-bank" | "bmo" | "eq" | "rbc-credit" | "rbc-chequing" | "chase" | "scotiabank" | "scotiabank-bank" | "td-credit" | "td-bank" | "unknown";
+type BankType = "cibc-credit" | "cibc-bank" | "bmo" | "bmo-credit" | "eq" | "rbc-credit" | "rbc-chequing" | "chase" | "scotiabank" | "scotiabank-bank" | "td-credit" | "td-bank" | "unknown";
 
 function detectBank(text: string): BankType {
-  const lower = text.toLowerCase();
+  // Normalize: collapse multiple spaces (pdfjs-dist can produce "TD   CASH   BACK   CARD")
+  const lower = text.toLowerCase().replace(/\s+/g, " ");
 
   // TD: check for credit card statements (TD Cash Back, TD Visa, etc.)
   // PDF text extraction may compress spaces: "tdcashback", "tdcanadatrust"
@@ -50,7 +51,20 @@ function detectBank(text: string): BankType {
     return "rbc-credit";
   }
 
-  if (lower.includes("bmo") || lower.includes("bank of montreal")) return "bmo";
+  // BMO: differentiate credit card vs chequing
+  // Check for chequing indicators FIRST (these keywords only appear in chequing statements)
+  if (lower.includes("bmo") || lower.includes("bank of montreal")) {
+    if (lower.includes("everydaybanking") || lower.includes("everyday banking") ||
+        lower.includes("performanceplan") || lower.includes("performance plan") ||
+        lower.includes("here's what happened") || lower.includes("here\u2019s what happened") ||
+        lower.includes("here\u2019swhathappened") || lower.includes("hereswhathappened") ||
+        lower.includes("statement of your account") || lower.includes("chequing"))
+      return "bmo";
+    if (lower.includes("mastercard") || lower.includes("cashback") || lower.includes("credit card") ||
+        lower.includes("cash back") || lower.includes("amount ($)") || /\d+\.\d{2}\s+cr\b/i.test(lower))
+      return "bmo-credit";
+    return "bmo";
+  }
 
   if (lower.includes("chase") || lower.includes("jpmorgan")) return "chase";
 
@@ -242,7 +256,7 @@ function parseTDCredit(lines: string[], year: number): RawTransaction[] {
     "i"
   );
 
-  for (const line of lines) {
+  for (let line of lines) {
     // Start parsing after common header patterns
     if (/ACTIVITY\s*DESCRIPTION\s*AMOUNT/i.test(line) ||
         /TRANSACTION\s*POSTING/i.test(line) ||
@@ -264,7 +278,13 @@ function parseTDCredit(lines: string[], year: number): RawTransaction[] {
     if (/TOTAL\s*NEW\s*BALANCE/i.test(line)) continue;
     if (/NEW\s*BALANCE/i.test(line) && !new RegExp(MONTH, "i").test(line)) continue;
     if (/CALCULATING/i.test(line)) { inSection = false; continue; }
-    if (/PAYMENT\s*INFORMATION/i.test(line)) { inSection = false; continue; }
+    // "PAYMENT INFORMATION" may share a line with a transaction (same Y-coord in PDF)
+    // e.g. "PAYMENT   INFORMATION  JAN 5   JAN 5   $4.11 RETAIL INTEREST"
+    if (/PAYMENT\s*INFORMATION/i.test(line)) {
+      const txnPart = line.match(new RegExp(`(${MONTH}\\s*\\d{1,2}\\s*${MONTH}\\s*\\d{1,2}\\s*\\$.+)$`, "i"));
+      if (!txnPart) { inSection = false; continue; }
+      line = txnPart[1]; // Strip prefix, keep parsing the transaction part
+    }
 
     let monthStr: string | undefined;
     let dayStr: string | undefined;
@@ -559,6 +579,63 @@ function parseTDBank(lines: string[], year: number): RawTransaction[] {
 // Line 3: "45.20330.47" (amounts: withdrawal/deposit + balance)
 // OR: "Jan 30SERVICE CHARGE\nCAPPED MONTHLY FEE$16.95\n..."
 
+// ─── CIBC Credit Card Parser ──────────────────────────────────────
+// CIBC credit card format (Adapta, Visa, etc.):
+//   "Jan 13Jan 14PAY WITH POINTS/PAIEMENT  PAR POINTS20.00"
+//   "JAN 19JAN 19APPLE.COM/BILL           TORONTO      ON45.19"
+// Trans date + Post date concatenated + Description + Amount (no spaces)
+// Payments section: amounts are credits (positive)
+// Charges section: amounts are debits (negative), unless prefixed with "-" (refund)
+
+function parseCIBCCredit(lines: string[], year: number): RawTransaction[] {
+  const txns: RawTransaction[] = [];
+  let inPayments = false;
+  let inCharges = false;
+
+  // Match: MonDDMonDD or Mon DDMon DD (trans date + post date at start)
+  const CIBC_CC_LINE = /^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2})\s*((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d{1,2})(.*?)(-?[\d,]+\.\d{2})\s*$/i;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Detect sections
+    if (/your\s*payments/i.test(line)) { inPayments = true; inCharges = false; continue; }
+    if (/your\s*new\s*charges/i.test(line) || /charges\s*and\s*credits/i.test(line)) { inCharges = true; inPayments = false; continue; }
+    if (/^total\s*(payments|for)/i.test(line) || /^total\s*for/i.test(line)) continue;
+    if (/^card\s*number/i.test(line)) continue;
+
+    if (!inPayments && !inCharges) continue;
+
+    const m = line.match(CIBC_CC_LINE);
+    if (!m) continue;
+
+    const transDateStr = m[1].trim();
+    const description = m[3].trim();
+    const amountStr = m[4].replace(/,/g, "");
+    const amount = parseFloat(amountStr);
+
+    if (isNaN(amount) || amount === 0) continue;
+    if (!description || isSkipDescription(description)) continue;
+
+    const date = parseMonthDayDate(transDateStr, year);
+    if (!date) continue;
+
+    // In payments section: amounts are credits (positive)
+    // In charges section: positive amounts are purchases (negative), negative amounts are refunds (positive)
+    let signedAmount: number;
+    if (inPayments) {
+      signedAmount = Math.abs(amount); // payments are credits
+    } else {
+      // charges section: if the original text had "-" prefix it's a refund
+      signedAmount = amountStr.startsWith("-") ? Math.abs(amount) : -Math.abs(amount);
+    }
+
+    txns.push({ date, description, amount: signedAmount });
+  }
+
+  return txns;
+}
+
 function parseCIBCBank(lines: string[], year: number): RawTransaction[] {
   const txns: RawTransaction[] = [];
   let inSection = false;
@@ -662,7 +739,71 @@ function parseCIBCBank(lines: string[], year: number): RawTransaction[] {
   return txns;
 }
 
-// ─── BMO Parser ───────────────────────────────────────────────────
+// ─── BMO Credit Card Parser ──────────────────────────────────────
+// BMO credit card format (CashBack Mastercard, etc.):
+//   "Dec. 27 Dec. 29   HOPP/O/2512271836   Toronto   ON   4.40"
+//   "Dec. 31 Dec. 31   DISPUTE CREDIT   50.00   CR"
+//   "Jan. 11 Jan. 12   TRSF FROM/DE ACCT/CPT   3993-XXXX-214   21.00 CR"
+// Trans date + Post date + Description + Amount (+ optional "CR" for credits)
+// From pdfjs-dist, spaces are preserved. "CR" = credit (positive), no CR = purchase (negative).
+
+function parseBMOCredit(lines: string[], year: number): RawTransaction[] {
+  const txns: RawTransaction[] = [];
+  let inSection = false;
+
+  // Match: "Dec. 27 Dec. 29" or "Jan. 3 Jan. 5" (with period after month abbreviation)
+  // Also match "Dec.27Dec.29" compressed form
+  const BMO_CC_DATE = /^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s*\d{1,2})\s+((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s*\d{1,2})\s+/i;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    // Detect transaction section
+    if (/transactions\s+since/i.test(line) || /trans\s*date/i.test(line)) {
+      inSection = true;
+      continue;
+    }
+    // Stop at totals/footer
+    if (/^subtotal\s+for/i.test(line) || /^total\s+for\s+(card|XXXX)/i.test(line)) continue;
+    if (/trade-?marks/i.test(line) || /^\*.*registered/i.test(line)) { inSection = false; continue; }
+    if (/^card\s*number/i.test(line)) continue;
+
+    if (!inSection) continue;
+
+    const dateMatch = line.match(BMO_CC_DATE);
+    if (!dateMatch) continue;
+
+    const transDateStr = dateMatch[1].replace(".", "").trim();
+    const rest = line.substring(dateMatch[0].length);
+
+    // Extract amount at end: "description text   123.45" or "description text   123.45 CR"
+    // Also handle cashback icon markers (🏠 or similar unicode)
+    const amountMatch = rest.match(/^(.*?)\s+([\d,]+\.\d{2})\s*(CR)?\s*$/i);
+    if (!amountMatch) continue;
+
+    let description = amountMatch[1].trim();
+    const amountVal = parseFloat(amountMatch[2].replace(/,/g, ""));
+    const isCR = !!amountMatch[3];
+
+    if (isNaN(amountVal) || amountVal === 0) continue;
+    // Remove leading cashback category icons (🏠 🔄 etc.)
+    description = description.replace(/^[\u{1F300}-\u{1F9FF}\u{2600}-\u{27BF}]\s*/u, "").trim();
+    if (!description || isSkipDescription(description)) continue;
+
+    const date = parseMonthDayDate(transDateStr, year);
+    if (!date) continue;
+
+    // CR = credit/payment (positive), no CR = purchase (negative)
+    const signedAmount = isCR ? Math.abs(amountVal) : -Math.abs(amountVal);
+
+    txns.push({ date, description, amount: signedAmount });
+  }
+
+  return txns;
+}
+
+// ─── BMO Chequing/Savings Parser ─────────────────────────────────
 // No-space format: "Jan31INTERACe-TransferReceived600.00638.05"
 // Amounts concatenated at end with no spaces. Uses .XX boundary detection.
 
@@ -775,24 +916,25 @@ function parseBMO(lines: string[], year: number): RawTransaction[] {
     const txSeg = segments[segments.length - 2];
 
     function parseSegmentValue(seg: { text: string }, allowNegative = false): number | null {
+      const trimmed = seg.text.trim();
       const re = allowNegative ? /^(-?\d[\d,]*\.\d{2})$/ : /^(\d[\d,]*\.\d{2})$/;
-      const m = seg.text.match(re);
+      const m = trimmed.match(re);
       if (m) {
         const s = m[1].replace(/,/g, "");
         if (isValidCommaAmount(m[1].replace("-", "")) || /^-?\d{1,3}\.\d{2}$/.test(m[1]) || /^\d{1,3}\.\d{2}$/.test(m[1]))
           return parseFloat(s);
       }
-      const cands = extractBMOAmountCandidates(seg.text);
+      const cands = extractBMOAmountCandidates(trimmed);
       return cands.length > 0 ? cands[cands.length - 1].value : null;
     }
 
     const lastVal = parseSegmentValue(lastSeg, true);
-    const txSegValClean = txSeg.text.match(/^(\d[\d,]*\.\d{2})$/);
+    const txSegValClean = txSeg.text.trim().match(/^(\d[\d,]*\.\d{2})$/);
     const txSegSingle =
       txSegValClean && (isValidCommaAmount(txSegValClean[1]) || /^\d{1,3}\.\d{2}$/.test(txSegValClean[1]))
         ? parseFloat(txSegValClean[1].replace(/,/g, ""))
         : null;
-    const txCandidates = txSegSingle != null ? [] : extractBMOAmountCandidates(txSeg.text);
+    const txCandidates = txSegSingle != null ? [] : extractBMOAmountCandidates(txSeg.text.trim());
 
     let balanceValue: number;
     let txAmountValue: number;
@@ -908,8 +1050,15 @@ function parseBMO(lines: string[], year: number): RawTransaction[] {
       continue;
     }
 
-    const dateMatch = line.match(/^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))(\d{1,2})/i);
+    const dateMatch = line.match(/^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))\s*(\d{1,2})/i);
     if (dateMatch) {
+      // Process any pending multi-line transaction before starting a new one
+      if (pendingDate !== null && pendingAfterDate !== "") {
+        processOneLine(pendingDate, pendingAfterDate, year);
+        pendingDate = null;
+        pendingAfterDate = "";
+      }
+
       if (!inSection) inSection = true;
       const date = parseMonthDayDate(`${dateMatch[1]} ${dateMatch[2]}`, year);
       if (!date) continue;
@@ -923,13 +1072,9 @@ function parseBMO(lines: string[], year: number): RawTransaction[] {
       if (dotPositions.length === 1 && /opening|closing|balance/i.test(afterDate)) {
         const m = afterDate.match(/(\d[\d,]*\.\d{2})/);
         if (m) prevBalance = parseFloat(m[1].replace(/,/g, ""));
-        pendingDate = null;
-        pendingAfterDate = "";
         continue;
       }
       if (dotPositions.length >= 2) {
-        pendingDate = null;
-        pendingAfterDate = "";
         processOneLine(date, afterDate, year);
         continue;
       }
@@ -951,6 +1096,11 @@ function parseBMO(lines: string[], year: number): RawTransaction[] {
         pendingAfterDate = (pendingAfterDate + " " + line.trim()).trim();
       }
     }
+  }
+
+  // Process any remaining pending transaction at end of loop
+  if (pendingDate !== null && pendingAfterDate !== "") {
+    processOneLine(pendingDate, pendingAfterDate, year);
   }
 
   // ── Second pass: recompute amounts from balance differences ──
@@ -1388,10 +1538,99 @@ export async function parsePDF(buffer: Buffer): Promise<RawTransaction[]> {
 }
 
 export async function parsePDFWithDetails(buffer: Buffer): Promise<PDFParseResult> {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const pdfParseModule = require("pdf-parse");
-  const pdfParse = (typeof pdfParseModule === "function" ? pdfParseModule : pdfParseModule.default) as (buf: Buffer) => Promise<{ text: string }>;
-  let data = await pdfParse(buffer);
+  // Check for encrypted PDFs before calling pdf-parse (which hangs on them)
+  // /Encrypt can appear anywhere in the PDF (often near the end in the xref/trailer)
+  const pdfRaw = buffer.toString("binary");
+  const isEncrypted = pdfRaw.includes("/Encrypt");
+
+  let data: { text: string };
+
+  if (isEncrypted) {
+    console.log("[pdfParser] PDF appears encrypted — using pdfjs-dist instead of pdf-parse");
+    // pdfjs-dist handles many encrypted PDFs that pdf-parse cannot
+    try {
+      // Use legacy build which works in Node.js without web worker setup
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs") as any;
+      const uint8 = new Uint8Array(buffer);
+      const pdf = await pdfjsLib.getDocument({ data: uint8 }).promise;
+      let allText = "";
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        // Group items by Y-position to reconstruct lines
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const items = content.items as any[];
+        const lineMap = new Map<number, string[]>();
+        for (const item of items) {
+          const y = item.transform ? Math.round(item.transform[5]) : 0;
+          if (!lineMap.has(y)) lineMap.set(y, []);
+          lineMap.get(y)!.push(item.str);
+        }
+        // Sort by Y descending (top of page first)
+        const sortedLines = [...lineMap.entries()]
+          .sort((a, b) => b[0] - a[0])
+          .map(([, strs]) => strs.join(" ").trim())
+          .filter(Boolean);
+        allText += sortedLines.join("\n") + "\n";
+      }
+      console.log(`[pdfParser] pdfjs-dist extracted ${allText.length} chars from encrypted PDF`);
+
+      // Check if pdfjs-dist produced fragmented text (e.g., "S t a t e m e n t")
+      // by measuring average word length — fragmented text has very short "words"
+      const words = allText.split(/\s+/).filter(w => w.length > 0);
+      const avgWordLen = words.length > 0 ? words.reduce((s, w) => s + w.length, 0) / words.length : 0;
+      const isFragmented = avgWordLen < 3 && words.length > 20;
+
+      if (isFragmented) {
+        console.log(`[pdfParser] pdfjs-dist text appears fragmented (avg word length: ${avgWordLen.toFixed(1)}), trying pdf-parse as fallback...`);
+        // Try pdf-parse with a short timeout — some encrypted PDFs work with pdf-parse
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-require-imports
+          const pdfParseModule = require("pdf-parse");
+          const pdfParse = (typeof pdfParseModule === "function" ? pdfParseModule : pdfParseModule.default) as (buf: Buffer) => Promise<{ text: string }>;
+          const fallbackData = await Promise.race([
+            pdfParse(buffer),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error("PDF parsing timed out")), 8000)
+            ),
+          ]);
+          if (fallbackData.text.trim().length > allText.trim().length * 0.3) {
+            console.log(`[pdfParser] pdf-parse fallback succeeded (${fallbackData.text.length} chars)`);
+            data = fallbackData;
+          } else {
+            data = { text: allText };
+          }
+        } catch {
+          console.log("[pdfParser] pdf-parse fallback failed/timed out, using fragmented pdfjs-dist text");
+          data = { text: allText };
+        }
+      } else {
+        data = { text: allText };
+      }
+    } catch (err) {
+      console.error("[pdfParser] pdfjs-dist also failed on encrypted PDF:", err);
+      data = { text: "" };
+    }
+  } else {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pdfParseModule = require("pdf-parse");
+    const pdfParse = (typeof pdfParseModule === "function" ? pdfParseModule : pdfParseModule.default) as (buf: Buffer) => Promise<{ text: string }>;
+
+    // Wrap pdf-parse in a timeout as safety net
+    const PDF_PARSE_TIMEOUT = 15000;
+    try {
+      data = await Promise.race([
+        pdfParse(buffer),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("PDF parsing timed out")), PDF_PARSE_TIMEOUT)
+        ),
+      ]);
+    } catch (err) {
+      console.error("[pdfParser] pdf-parse failed or timed out:", err);
+      data = { text: "" };
+    }
+  }
   let text = data.text;
   let lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
 
@@ -1426,8 +1665,13 @@ export async function parsePDFWithDetails(buffer: Buffer): Promise<PDFParseResul
       transactions = parseScotiabank(lines, year);
       break;
     case "cibc-bank":
-    case "cibc-credit":
       transactions = parseCIBCBank(lines, year);
+      break;
+    case "cibc-credit":
+      transactions = parseCIBCCredit(lines, year);
+      break;
+    case "bmo-credit":
+      transactions = parseBMOCredit(lines, year);
       break;
     case "bmo":
     case "scotiabank-bank":

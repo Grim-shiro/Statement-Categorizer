@@ -493,6 +493,121 @@ function heuristicSign(description: string, amount: number): number {
   return -amount;
 }
 
+// Detect transaction types using running totals / balance analysis
+// Returns a reason string and updated transactions with corrected signs
+interface SignAnalysis {
+  transactions: RawTransaction[];
+  method: "running-balance" | "column-position" | "heuristic";
+  explanation: string;
+  confidence: "high" | "medium" | "low";
+  details: string[];
+}
+
+function analyzeTransactionSigns(
+  txns: RawTransaction[],
+  lines: string[]
+): SignAnalysis {
+  const details: string[] = [];
+
+  // Method 1: Check if lines have separate withdrawal/deposit columns
+  // Look for column headers
+  const headerLine = lines.find((l) => {
+    const lower = l.toLowerCase();
+    return (
+      (lower.includes("withdrawal") || lower.includes("debit")) &&
+      (lower.includes("deposit") || lower.includes("credit"))
+    );
+  });
+
+  if (headerLine) {
+    details.push(`Detected column headers: "${headerLine.trim()}"`);
+    // Already handled by parseBankTable — signs should be correct
+    return {
+      transactions: txns,
+      method: "column-position",
+      explanation:
+        "Detected separate Withdrawal/Deposit columns in the statement. Transaction signs are based on which column the amount appears in.",
+      confidence: "high",
+      details,
+    };
+  }
+
+  // Method 2: Try to find a running balance pattern
+  // Look for lines that have 2+ dollar amounts (last one being balance)
+  const AMT_RE = /\$?([\d,]+\.\d{2})/g;
+  const balanceRows: { txIdx: number; amounts: number[] }[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const amounts: number[] = [];
+    let m: RegExpExecArray | null;
+    const re = new RegExp(AMT_RE.source, "g");
+    while ((m = re.exec(lines[i])) !== null) {
+      amounts.push(parseFloat(m[1].replace(/,/g, "")));
+    }
+    if (amounts.length >= 2) {
+      balanceRows.push({ txIdx: i, amounts });
+    }
+  }
+
+  if (balanceRows.length >= 2) {
+    // Try to infer sign from balance changes
+    let balanceMatched = 0;
+    let balanceTotal = 0;
+    const updatedTxns = [...txns];
+
+    for (let i = 1; i < balanceRows.length && i < txns.length; i++) {
+      const prevBal = balanceRows[i - 1].amounts[balanceRows[i - 1].amounts.length - 1];
+      const curBal = balanceRows[i].amounts[balanceRows[i].amounts.length - 1];
+      const txAmt = Math.abs(txns[i]?.amount ?? 0);
+      const delta = Math.round((curBal - prevBal) * 100) / 100;
+
+      balanceTotal++;
+      if (Math.abs(Math.abs(delta) - txAmt) < 0.02) {
+        balanceMatched++;
+        if (delta > 0) {
+          updatedTxns[i] = { ...updatedTxns[i], amount: txAmt };
+        } else {
+          updatedTxns[i] = { ...updatedTxns[i], amount: -txAmt };
+        }
+      }
+    }
+
+    if (balanceMatched > 0 && balanceMatched >= balanceTotal * 0.5) {
+      details.push(
+        `Found running balance in ${balanceRows.length} rows.`,
+        `Successfully matched ${balanceMatched}/${balanceTotal} transactions to balance changes.`
+      );
+      return {
+        transactions: updatedTxns,
+        method: "running-balance",
+        explanation: `Detected a running balance column. Used balance changes to determine ${balanceMatched} transaction sign(s). Remaining transactions use keyword-based heuristics.`,
+        confidence: balanceMatched === balanceTotal ? "high" : "medium",
+        details,
+      };
+    }
+  }
+
+  // Method 3: Heuristic-only (keyword-based)
+  details.push(
+    "No running balance or separate columns detected.",
+    "Using keyword-based heuristics (e.g., 'payment', 'deposit', 'fee') to determine credit/debit."
+  );
+
+  const updatedTxns = txns.map((tx) => ({
+    ...tx,
+    amount: heuristicSign(tx.description, Math.abs(tx.amount)),
+  }));
+
+  return {
+    transactions: updatedTxns,
+    method: "heuristic",
+    explanation:
+      "No balance column found. Transaction types were determined using keyword patterns in descriptions (e.g., payments, fees → withdrawal; deposits, refunds → credit).",
+    confidence: "low",
+    details,
+  };
+}
+
 export default function PDFVisualizer({
   data,
   onDismiss,
@@ -504,11 +619,14 @@ export default function PDFVisualizer({
   const [search, setSearch] = useState("");
   const [rangeStart, setRangeStart] = useState<number | null>(null);
   const [rangeEnd, setRangeEnd] = useState<number | null>(null);
-  const [step, setStep] = useState<"select" | "preview">("select");
+  const [step, setStep] = useState<"select" | "review" | "preview">("select");
   const [extractedTxns, setExtractedTxns] = useState<RawTransaction[]>([]);
   const [pdfSelections, setPdfSelections] = useState<SelectionRect[]>([]);
   const [extracting, setExtracting] = useState(false);
   const lastClickedRef = useRef<number | null>(null);
+  const [signAnalysis, setSignAnalysis] = useState<SignAnalysis | null>(null);
+  const [reviewTxns, setReviewTxns] = useState<RawTransaction[]>([]);
+  const [extractedLines, setExtractedLines] = useState<string[]>([]);
 
   const filteredLines = useMemo(() => {
     if (!search.trim())
@@ -602,6 +720,7 @@ export default function PDFVisualizer({
       // Clean OCR artifacts from all extracted lines
       const cleanedLines = allLines.map(cleanOcrLine);
       console.log("[PDFVisualizer] Extracted lines (cleaned):", cleanedLines);
+      setExtractedLines(cleanedLines);
 
       // First try: parse as a bank table (with header detection)
       let txns = parseBankTable(cleanedLines);
@@ -614,8 +733,12 @@ export default function PDFVisualizer({
         }
       }
 
+      // Analyze credit/debit signs using running totals
+      const analysis = analyzeTransactionSigns(txns, cleanedLines);
+      setSignAnalysis(analysis);
+      setReviewTxns(analysis.transactions.map((tx) => ({ ...tx })));
       setExtractedTxns(txns);
-      setStep("preview");
+      setStep("review");
     } catch (err) {
       console.error("[PDFVisualizer] Extract failed:", err);
     } finally {
@@ -629,32 +752,28 @@ export default function PDFVisualizer({
     const lo = rangeEnd !== null ? Math.min(rangeStart, rangeEnd) : rangeStart;
     const hi = rangeEnd !== null ? Math.max(rangeStart, rangeEnd) : rangeStart;
     const sectionLines = data.rawLines.slice(lo, hi + 1);
+    setExtractedLines(sectionLines);
     const txns: RawTransaction[] = [];
     for (const line of sectionLines) {
       const tx = extractTransactionFromLine(line);
       if (tx) txns.push(tx);
     }
+    // Analyze credit/debit signs
+    const analysis = analyzeTransactionSigns(txns, sectionLines);
+    setSignAnalysis(analysis);
+    setReviewTxns(analysis.transactions.map((tx) => ({ ...tx })));
     setExtractedTxns(txns);
-    setStep("preview");
+    setStep("review");
   }, [rangeStart, rangeEnd, data.rawLines]);
 
   const handleConfirm = useCallback(() => {
-    if (extractedTxns.length === 0) return;
+    const finalTxns = reviewTxns.length > 0 ? reviewTxns : extractedTxns;
+    if (finalTxns.length === 0) return;
 
     // Get the lines for pattern learning
-    let sectionLines: string[] = [];
-    if (viewMode === "text" && rangeStart !== null) {
-      const lo =
-        rangeEnd !== null ? Math.min(rangeStart, rangeEnd) : rangeStart;
-      const hi =
-        rangeEnd !== null ? Math.max(rangeStart, rangeEnd) : rangeStart;
-      sectionLines = data.rawLines.slice(lo, hi + 1);
-    } else {
-      // Use extracted txn descriptions as sample lines
-      sectionLines = extractedTxns.map(
-        (tx) => `${tx.date} ${tx.description} ${tx.amount}`
-      );
-    }
+    const sectionLines = extractedLines.length > 0
+      ? extractedLines
+      : finalTxns.map((tx) => `${tx.date} ${tx.description} ${tx.amount}`);
 
     const pattern = buildPatternFromLines(sectionLines);
     try {
@@ -675,12 +794,11 @@ export default function PDFVisualizer({
       // ignore
     }
 
-    onTransactionsExtracted(extractedTxns, data.bankDetected);
+    onTransactionsExtracted(finalTxns, data.bankDetected);
   }, [
+    reviewTxns,
     extractedTxns,
-    viewMode,
-    rangeStart,
-    rangeEnd,
+    extractedLines,
     data,
     onTransactionsExtracted,
   ]);
@@ -688,6 +806,220 @@ export default function PDFVisualizer({
   const handleBack = useCallback(() => {
     setStep("select");
   }, []);
+
+  // Toggle the sign of a transaction in review
+  const toggleTxnSign = useCallback((idx: number) => {
+    setReviewTxns((prev) =>
+      prev.map((tx, i) =>
+        i === idx ? { ...tx, amount: -tx.amount } : tx
+      )
+    );
+  }, []);
+
+  // Proceed from review to final preview/confirm
+  const handleReviewConfirm = useCallback(() => {
+    setExtractedTxns(reviewTxns);
+    setStep("preview");
+  }, [reviewTxns]);
+
+  // ─── Review Step (Credit/Debit Clarification) ─────────────────
+  if (step === "review") {
+    const totalCredits = reviewTxns
+      .filter((tx) => tx.amount > 0)
+      .reduce((sum, tx) => sum + tx.amount, 0);
+    const totalDebits = reviewTxns
+      .filter((tx) => tx.amount < 0)
+      .reduce((sum, tx) => sum + Math.abs(tx.amount), 0);
+
+    return (
+      <div className="bg-white rounded-xl border border-blue-200 shadow-sm overflow-hidden">
+        {/* Header */}
+        <div className="bg-blue-50 border-b border-blue-200 px-5 py-4">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 p-2 bg-blue-100 rounded-lg">
+              <svg
+                className="w-5 h-5 text-blue-600"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                />
+              </svg>
+            </div>
+            <div className="flex-1">
+              <h3 className="text-sm font-semibold text-blue-900">
+                Review Credit/Debit Classification
+              </h3>
+              <p className="text-xs text-blue-700 mt-1">
+                We detected {reviewTxns.length} transaction{reviewTxns.length !== 1 ? "s" : ""}.
+                Please verify the credit/debit classification below before proceeding.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Analysis explanation */}
+        {signAnalysis && (
+          <div className="px-5 py-3 border-b border-gray-100 bg-gray-50/50">
+            <div className="flex items-start gap-2">
+              <span
+                className={`mt-0.5 flex-shrink-0 px-2 py-0.5 text-[10px] font-bold uppercase rounded-full ${
+                  signAnalysis.confidence === "high"
+                    ? "bg-green-100 text-green-700"
+                    : signAnalysis.confidence === "medium"
+                    ? "bg-yellow-100 text-yellow-700"
+                    : "bg-orange-100 text-orange-700"
+                }`}
+              >
+                {signAnalysis.confidence} confidence
+              </span>
+              <div className="flex-1">
+                <p className="text-xs text-gray-700">
+                  <span className="font-medium">Method:</span>{" "}
+                  {signAnalysis.explanation}
+                </p>
+                {signAnalysis.details.length > 0 && (
+                  <ul className="mt-1 text-[11px] text-gray-500 space-y-0.5">
+                    {signAnalysis.details.map((d, i) => (
+                      <li key={i} className="flex items-start gap-1">
+                        <span className="text-gray-400 mt-px">•</span>
+                        {d}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+
+            {/* Summary totals */}
+            <div className="flex gap-4 mt-3">
+              <div className="flex items-center gap-1.5 px-3 py-1.5 bg-green-50 border border-green-200 rounded-lg">
+                <span className="text-xs text-green-600 font-medium">Credits (Deposits):</span>
+                <span className="text-xs text-green-700 font-bold">
+                  ${totalCredits.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+                <span className="text-[10px] text-green-500">
+                  ({reviewTxns.filter((tx) => tx.amount > 0).length})
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 border border-red-200 rounded-lg">
+                <span className="text-xs text-red-600 font-medium">Debits (Withdrawals):</span>
+                <span className="text-xs text-red-700 font-bold">
+                  ${totalDebits.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+                <span className="text-[10px] text-red-500">
+                  ({reviewTxns.filter((tx) => tx.amount < 0).length})
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Transaction table with toggle */}
+        <div className="max-h-[400px] overflow-y-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 sticky top-0">
+              <tr>
+                <th className="text-left px-4 py-2 text-xs font-medium text-gray-500">#</th>
+                <th className="text-left px-4 py-2 text-xs font-medium text-gray-500">Date</th>
+                <th className="text-left px-4 py-2 text-xs font-medium text-gray-500">Description</th>
+                <th className="text-right px-4 py-2 text-xs font-medium text-gray-500">Amount</th>
+                <th className="text-center px-4 py-2 text-xs font-medium text-gray-500">Type</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {reviewTxns.map((tx, idx) => (
+                <tr key={idx} className="hover:bg-gray-50 group">
+                  <td className="px-4 py-2 text-xs text-gray-400">{idx + 1}</td>
+                  <td className="px-4 py-2 text-xs text-gray-600 whitespace-nowrap">
+                    {tx.date || "\u2014"}
+                  </td>
+                  <td className="px-4 py-2 text-xs text-gray-800 max-w-[250px] truncate">
+                    {tx.description}
+                  </td>
+                  <td
+                    className={`px-4 py-2 text-xs text-right whitespace-nowrap font-medium ${
+                      tx.amount < 0 ? "text-red-600" : "text-green-600"
+                    }`}
+                  >
+                    {tx.amount < 0 ? "-" : "+"}$
+                    {Math.abs(tx.amount).toLocaleString("en-US", {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}
+                  </td>
+                  <td className="px-4 py-2 text-center">
+                    <button
+                      onClick={() => toggleTxnSign(idx)}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-full transition-all border ${
+                        tx.amount < 0
+                          ? "bg-red-50 text-red-700 border-red-200 hover:bg-red-100"
+                          : "bg-green-50 text-green-700 border-green-200 hover:bg-green-100"
+                      }`}
+                      title="Click to flip credit/debit"
+                    >
+                      {tx.amount < 0 ? (
+                        <>
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+                          </svg>
+                          Debit
+                        </>
+                      ) : (
+                        <>
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                          </svg>
+                          Credit
+                        </>
+                      )}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 bg-gray-50 border-t border-gray-100 flex items-center justify-between">
+          <button
+            onClick={() => setStep("select")}
+            className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-200 rounded-lg transition-colors flex items-center gap-1"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+            </svg>
+            Re-select area
+          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onDismiss}
+              className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
+            >
+              Cancel
+            </button>
+            {reviewTxns.length > 0 && (
+              <button
+                onClick={handleReviewConfirm}
+                className="px-5 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium flex items-center gap-2"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+                Looks Good — Confirm &amp; Learn ({reviewTxns.length})
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // ─── Preview Step ───────────────────────────────────────────────
   if (step === "preview") {

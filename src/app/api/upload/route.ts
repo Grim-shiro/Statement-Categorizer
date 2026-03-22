@@ -6,7 +6,8 @@ import { encryptServer, decryptServer } from "@/lib/serverEncryption";
 /** Convert bankDetected id to a human-readable "BANK TYPE Statement" label */
 function bankLabel(bankDetected: string, txCount: number): string {
   const BANK_LABELS: Record<string, string> = {
-    "bmo": "BMO Credit",
+    "bmo": "BMO Chequing",
+    "bmo-credit": "BMO Credit Card",
     "cibc-credit": "CIBC Credit Card",
     "cibc-bank": "CIBC Chequing",
     "eq": "EQ Bank",
