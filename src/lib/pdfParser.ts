@@ -637,7 +637,8 @@ function parseCIBCCredit(lines: string[], year: number): RawTransaction[] {
 }
 
 function parseCIBCBank(lines: string[], year: number): RawTransaction[] {
-  const txns: RawTransaction[] = [];
+  interface CIBCParsedTxn { date: string; description: string; amount: number; balance: number | null }
+  const parsed: CIBCParsedTxn[] = [];
   let inSection = false;
   let lastDate: string | null = null;
   let currentDesc: string[] = [];
@@ -679,7 +680,7 @@ function parseCIBCBank(lines: string[], year: number): RawTransaction[] {
     }
     if (balance !== null) prevBalance = balance;
 
-    txns.push({ date: lastDate!, description, amount });
+    parsed.push({ date: lastDate!, description, amount, balance });
   }
 
   for (let i = 0; i < lines.length; i++) {
@@ -736,7 +737,18 @@ function parseCIBCBank(lines: string[], year: number): RawTransaction[] {
     }
   }
 
-  return txns;
+  // ── Second pass: recompute amounts from balance differences ──
+  for (let i = 1; i < parsed.length; i++) {
+    if (parsed[i].balance !== null && parsed[i - 1].balance !== null) {
+      const balanceDiff = Math.abs(parsed[i - 1].balance! - parsed[i].balance!);
+      if (balanceDiff >= 0.01) {
+        const sign = parsed[i].balance! < parsed[i - 1].balance! ? -1 : 1;
+        parsed[i].amount = Math.round(sign * balanceDiff * 100) / 100;
+      }
+    }
+  }
+
+  return parsed.map(({ date, description, amount }) => ({ date, description, amount }));
 }
 
 // ─── BMO Credit Card Parser ──────────────────────────────────────
@@ -1122,7 +1134,8 @@ function parseBMO(lines: string[], year: number): RawTransaction[] {
 // Line 2: "-$100.00$420.00" (amounts: withdrawal/deposit + balance)
 
 function parseEQBank(lines: string[], year: number): RawTransaction[] {
-  const txns: RawTransaction[] = [];
+  interface EQParsedTxn { date: string; description: string; amount: number; balance: number | null }
+  const parsed: EQParsedTxn[] = [];
   let inSection = false;
 
   for (let i = 0; i < lines.length; i++) {
@@ -1159,11 +1172,27 @@ function parseEQBank(lines: string[], year: number): RawTransaction[] {
     const amount = parseAmountStr(amountMatches[0]);
     if (isNaN(amount) || amount === 0) continue;
 
-    txns.push({ date, description, amount });
+    const balance = amountMatches.length >= 2 ? parseAmountStr(amountMatches[amountMatches.length - 1]) : null;
+
+    parsed.push({ date, description, amount, balance });
     i++; // Skip the amount line
   }
 
-  return txns;
+  // ── Second pass: verify/recompute amounts from balance differences ──
+  for (let i = 1; i < parsed.length; i++) {
+    if (parsed[i].balance !== null && parsed[i - 1].balance !== null) {
+      const balanceDiff = Math.round((parsed[i].balance! - parsed[i - 1].balance!) * 100) / 100;
+      // If sign from PDF matches balance diff direction, amount is correct
+      // Otherwise, recompute from balance diff
+      if (Math.abs(balanceDiff) >= 0.01 && Math.abs(Math.abs(balanceDiff) - Math.abs(parsed[i].amount)) < 0.02) {
+        // Amount matches, just ensure sign is correct
+        const sign = balanceDiff > 0 ? 1 : -1;
+        parsed[i].amount = Math.round(sign * Math.abs(parsed[i].amount) * 100) / 100;
+      }
+    }
+  }
+
+  return parsed.map(({ date, description, amount }) => ({ date, description, amount }));
 }
 
 // ─── RBC Credit Card Parser ──────────────────────────────────────
@@ -1259,7 +1288,8 @@ function parseRBCCredit(lines: string[], year: number): RawTransaction[] {
 // Date format: "DD Mon" (day before month)
 
 function parseRBCChequing(lines: string[], year: number): RawTransaction[] {
-  const txns: RawTransaction[] = [];
+  interface RBCParsedTxn { date: string; description: string; amount: number; balance: number | null }
+  const parsed: RBCParsedTxn[] = [];
   let inSection = false;
   let prevBalance: number | null = null;
   let lastDate: string | null = null;
@@ -1371,7 +1401,7 @@ function parseRBCChequing(lines: string[], year: number): RawTransaction[] {
 
     if (balance !== null) prevBalance = balance;
     if (signedAmount !== 0) {
-      txns.push({ date: lastDate!, description, amount: signedAmount });
+      parsed.push({ date: lastDate!, description, amount: signedAmount, balance });
     }
   }
 
@@ -1432,7 +1462,18 @@ function parseRBCChequing(lines: string[], year: number): RawTransaction[] {
     }
   }
 
-  return txns;
+  // ── Second pass: recompute amounts from balance differences ──
+  for (let i = 1; i < parsed.length; i++) {
+    if (parsed[i].balance !== null && parsed[i - 1].balance !== null) {
+      const balanceDiff = Math.abs(parsed[i - 1].balance! - parsed[i].balance!);
+      if (balanceDiff >= 0.01) {
+        const sign = parsed[i].balance! < parsed[i - 1].balance! ? -1 : 1;
+        parsed[i].amount = Math.round(sign * balanceDiff * 100) / 100;
+      }
+    }
+  }
+
+  return parsed.map(({ date, description, amount }) => ({ date, description, amount }));
 }
 
 // ─── Generic Fallback Parser ──────────────────────────────────────

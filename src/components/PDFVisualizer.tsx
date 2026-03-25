@@ -505,7 +505,8 @@ interface SignAnalysis {
 
 function analyzeTransactionSigns(
   txns: RawTransaction[],
-  lines: string[]
+  lines: string[],
+  documentType: "bank" | "credit-card" | null = null
 ): SignAnalysis {
   const details: string[] = [];
 
@@ -587,11 +588,45 @@ function analyzeTransactionSigns(
     }
   }
 
-  // Method 3: Heuristic-only (keyword-based)
-  details.push(
-    "No running balance or separate columns detected.",
-    "Using keyword-based heuristics (e.g., 'payment', 'deposit', 'fee') to determine credit/debit."
-  );
+  // Method 3: Credit card — most amounts are charges (negative), payments are positive
+  if (documentType === "credit-card") {
+    details.push(
+      "Document identified as credit card statement.",
+      "All amounts treated as charges (debit) unless description indicates a payment, refund, or credit."
+    );
+
+    const updatedTxns = txns.map((tx) => {
+      const desc = tx.description.toLowerCase();
+      const isCredit =
+        /payment|refund|credit|rebate|cashback|cash\s*back|reward|reversal|dispute|returned/i.test(desc);
+      return {
+        ...tx,
+        amount: isCredit ? Math.abs(tx.amount) : -Math.abs(tx.amount),
+      };
+    });
+
+    return {
+      transactions: updatedTxns,
+      method: "heuristic",
+      explanation:
+        "Credit card statement: all transactions are charges (debit) unless marked as payment, refund, or credit.",
+      confidence: "medium",
+      details,
+    };
+  }
+
+  // Method 4: Bank statement without balance columns — use keyword heuristics
+  if (documentType === "bank") {
+    details.push(
+      "Document identified as bank statement, but no running balance column detected.",
+      "Using keyword-based heuristics to determine withdrawals vs deposits."
+    );
+  } else {
+    details.push(
+      "No running balance or separate columns detected.",
+      "Using keyword-based heuristics (e.g., 'payment', 'deposit', 'fee') to determine credit/debit."
+    );
+  }
 
   const updatedTxns = txns.map((tx) => ({
     ...tx,
@@ -601,8 +636,9 @@ function analyzeTransactionSigns(
   return {
     transactions: updatedTxns,
     method: "heuristic",
-    explanation:
-      "No balance column found. Transaction types were determined using keyword patterns in descriptions (e.g., payments, fees → withdrawal; deposits, refunds → credit).",
+    explanation: documentType === "bank"
+      ? "Bank statement without a visible balance column. Used keyword patterns to determine withdrawals vs deposits."
+      : "No balance column found. Transaction types were determined using keyword patterns in descriptions (e.g., payments, fees → withdrawal; deposits, refunds → credit).",
     confidence: "low",
     details,
   };
@@ -619,7 +655,7 @@ export default function PDFVisualizer({
   const [search, setSearch] = useState("");
   const [rangeStart, setRangeStart] = useState<number | null>(null);
   const [rangeEnd, setRangeEnd] = useState<number | null>(null);
-  const [step, setStep] = useState<"select" | "review" | "preview">("select");
+  const [step, setStep] = useState<"select" | "doc-type" | "review" | "preview">("select");
   const [extractedTxns, setExtractedTxns] = useState<RawTransaction[]>([]);
   const [pdfSelections, setPdfSelections] = useState<SelectionRect[]>([]);
   const [extracting, setExtracting] = useState(false);
@@ -627,6 +663,7 @@ export default function PDFVisualizer({
   const [signAnalysis, setSignAnalysis] = useState<SignAnalysis | null>(null);
   const [reviewTxns, setReviewTxns] = useState<RawTransaction[]>([]);
   const [extractedLines, setExtractedLines] = useState<string[]>([]);
+  const [docType, setDocType] = useState<"bank" | "credit-card" | null>(null);
 
   const filteredLines = useMemo(() => {
     if (!search.trim())
@@ -733,12 +770,8 @@ export default function PDFVisualizer({
         }
       }
 
-      // Analyze credit/debit signs using running totals
-      const analysis = analyzeTransactionSigns(txns, cleanedLines);
-      setSignAnalysis(analysis);
-      setReviewTxns(analysis.transactions.map((tx) => ({ ...tx })));
       setExtractedTxns(txns);
-      setStep("review");
+      setStep("doc-type");
     } catch (err) {
       console.error("[PDFVisualizer] Extract failed:", err);
     } finally {
@@ -758,12 +791,8 @@ export default function PDFVisualizer({
       const tx = extractTransactionFromLine(line);
       if (tx) txns.push(tx);
     }
-    // Analyze credit/debit signs
-    const analysis = analyzeTransactionSigns(txns, sectionLines);
-    setSignAnalysis(analysis);
-    setReviewTxns(analysis.transactions.map((tx) => ({ ...tx })));
     setExtractedTxns(txns);
-    setStep("review");
+    setStep("doc-type");
   }, [rangeStart, rangeEnd, data.rawLines]);
 
   const handleConfirm = useCallback(() => {
@@ -807,6 +836,15 @@ export default function PDFVisualizer({
     setStep("select");
   }, []);
 
+  // Handle document type selection — run analysis then proceed to review
+  const handleDocTypeSelect = useCallback((type: "bank" | "credit-card") => {
+    setDocType(type);
+    const analysis = analyzeTransactionSigns(extractedTxns, extractedLines, type);
+    setSignAnalysis(analysis);
+    setReviewTxns(analysis.transactions.map((tx) => ({ ...tx })));
+    setStep("review");
+  }, [extractedTxns, extractedLines]);
+
   // Toggle the sign of a transaction in review
   const toggleTxnSign = useCallback((idx: number) => {
     setReviewTxns((prev) =>
@@ -821,6 +859,96 @@ export default function PDFVisualizer({
     setExtractedTxns(reviewTxns);
     setStep("preview");
   }, [reviewTxns]);
+
+  // ─── Document Type Step ────────────────────────────────────────
+  if (step === "doc-type") {
+    return (
+      <div className="bg-white rounded-xl border border-purple-200 shadow-sm overflow-hidden">
+        <div className="bg-purple-50 border-b border-purple-200 px-5 py-4">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 p-2 bg-purple-100 rounded-lg">
+              <svg className="w-5 h-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-purple-900">
+                What type of document is this?
+              </h3>
+              <p className="text-xs text-purple-700 mt-1">
+                Found {extractedTxns.length} transaction{extractedTxns.length !== 1 ? "s" : ""}.
+                This helps us correctly categorize credits and debits.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="px-5 py-6">
+          <div className="grid grid-cols-2 gap-4 max-w-lg mx-auto">
+            {/* Bank Statement Option */}
+            <button
+              onClick={() => handleDocTypeSelect("bank")}
+              className="flex flex-col items-center gap-3 p-5 border-2 border-gray-200 rounded-xl hover:border-blue-400 hover:bg-blue-50 transition-all group"
+            >
+              <div className="p-3 bg-blue-100 rounded-xl group-hover:bg-blue-200 transition-colors">
+                <svg className="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <div className="text-center">
+                <p className="text-sm font-semibold text-gray-800">Bank Statement</p>
+                <p className="text-[11px] text-gray-500 mt-1">
+                  Chequing / Savings account with withdrawals &amp; deposits
+                </p>
+              </div>
+              <span className="text-[10px] text-blue-600 font-medium bg-blue-50 px-2 py-0.5 rounded-full">
+                Uses balance validation
+              </span>
+            </button>
+
+            {/* Credit Card Option */}
+            <button
+              onClick={() => handleDocTypeSelect("credit-card")}
+              className="flex flex-col items-center gap-3 p-5 border-2 border-gray-200 rounded-xl hover:border-amber-400 hover:bg-amber-50 transition-all group"
+            >
+              <div className="p-3 bg-amber-100 rounded-xl group-hover:bg-amber-200 transition-colors">
+                <svg className="w-8 h-8 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+                </svg>
+              </div>
+              <div className="text-center">
+                <p className="text-sm font-semibold text-gray-800">Credit Card</p>
+                <p className="text-[11px] text-gray-500 mt-1">
+                  Charges &amp; payments on a credit card account
+                </p>
+              </div>
+              <span className="text-[10px] text-amber-600 font-medium bg-amber-50 px-2 py-0.5 rounded-full">
+                Charges as debits
+              </span>
+            </button>
+          </div>
+        </div>
+
+        <div className="px-5 py-3 bg-gray-50 border-t border-gray-100 flex items-center justify-between">
+          <button
+            onClick={() => setStep("select")}
+            className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800 hover:bg-gray-200 rounded-lg transition-colors flex items-center gap-1"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+            </svg>
+            Re-select area
+          </button>
+          <button
+            onClick={onDismiss}
+            className="px-4 py-2 text-sm text-gray-500 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // ─── Review Step (Credit/Debit Clarification) ─────────────────
   if (step === "review") {
